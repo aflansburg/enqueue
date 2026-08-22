@@ -2922,7 +2922,7 @@ ${notes}`
     if (cameraBtn)
       cameraBtn.addEventListener("click", () => {
         pillCloseMenu(true);
-        invoke("mobile_capture_image").catch(() => {});
+        invoke("mobile_capture_camera").catch(() => {});
       });
 
     // Link
@@ -3279,7 +3279,6 @@ ${notes}`
     console.log("[resume] online event - triggering sync");
     if (window.mobileSyncAndReconcile) window.mobileSyncAndReconcile();
   })}
-;
 </script>
 </body>
 </html>

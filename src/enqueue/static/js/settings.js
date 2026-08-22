@@ -243,7 +243,8 @@ async function renderSettingsAI() {
 	// Connection: how the app reaches a model - the backend, the model name,
 	// the URL, the key, and any extra headers. Reads first, because a person
 	// sets the wire before they tune behaviour (N.7b).
-	html += '<div class="shelf">Connection</div><div class="card" style="margin-bottom: var(--sp-4);"><div class="group">';
+	html +=
+		'<div class="shelf">Connection</div><div class="group" style="margin-bottom: var(--sp-4);">';
 	const chosen = d.settings.llm_backend;
 	html +=
 		'<div class="field"><label for="s_backend">Answers come from</label>' +
@@ -312,10 +313,11 @@ async function renderSettingsAI() {
 		});
 	}
 
-		html += "</div></div>";
+	html += "</div></div>";
 
 	// --- API Key ---
-	html += '<div class="shelf">API Key</div><div class="card" style="margin-bottom: var(--sp-4);"><div class="group">';
+	html +=
+		'<div class="shelf">API Key</div><div class="group" style="margin-bottom: var(--sp-4);">';
 	const keyed = d.storage.api_key_present;
 	html +=
 		'<div class="field"><label for="s_key">API key</label>' +
@@ -349,7 +351,8 @@ async function renderSettingsAI() {
 	// Behavior: how the model is used once connected - retries, the vision
 	// model, and the concept-layer rebuild.
 	html += '<div class="settings-divider"></div>';
-	html += '<div class="shelf">Behavior</div><div class="card" style="margin-bottom: var(--sp-4);"><div class="group">';
+	html +=
+		'<div class="shelf">Behavior</div><div class="group" style="margin-bottom: var(--sp-4);">';
 	for (const name of ["model_retries", "vision_model"]) {
 		const f = d.settings[name];
 		html += fieldRow(name, esc(SETTING_LABELS[name]), {
@@ -373,14 +376,14 @@ async function renderSettingsAI() {
 	// setting: it fires now and runs in the background, so it lives outside the
 	// Save/Discard bar below.
 	html +=
-		'<div class="shelf">Search concepts</div><div class="card" style="margin-bottom: var(--sp-4);"><div class="group">' +
+		'<div class="shelf">Search concepts</div><div class="group" style="margin-bottom: var(--sp-4);">' +
 		'<div class="field"><label>Concepts (facets)</label>' +
 		'<button class="btn secondary" id="rebuildFacetsBtn" onclick="rebuildFacets()">Rebuild concepts</button>' +
 		'<div class="aside">Concepts are what an item could be an example of - ' +
 		'"lamp", "sour", "packing list". The model reads them when you save, and ' +
 		"search and the looks-like groupings use them. Rebuilding re-analyzes every " +
 		"item with the current model; it runs in the background, one model call per item." +
-		'</div><div id="facetRebuildState" class="aside"></div></div></div>';
+		'</div><div id="facetRebuildState" class="aside"></div></div>';
 
 	html += settingsActionsBar();
 	return html;
@@ -892,8 +895,9 @@ function generateSyncSecret() {
 	return Array.from(array, (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-function renderSyncConfigured(sync) {
-	let html = '<div class="shelf">Link a device</div><div class="card" style="margin-bottom: var(--sp-4);"><div class="group">';
+function renderSyncConfigured(_sync) {
+	let html =
+		'<div class="shelf">Link a device</div><div class="group" style="margin-bottom: var(--sp-4);">';
 	html +=
 		'<div class="aside">On your phone, open the Enqueue app and choose "Link a device". ' +
 		"The phone camera scans the QR below and receives the encryption key in one " +
@@ -913,7 +917,8 @@ function renderSyncConfigured(sync) {
 		"</div>" +
 		"</div>";
 
-	html += '<div class="shelf">Reset sync</div><div class="card" style="margin-top: var(--sp-4);"><div class="group">';
+	html +=
+		'<div class="shelf">Reset sync</div><div class="card" style="margin-top: var(--sp-4);"><div class="group">';
 	html +=
 		'<div class="aside caution">' +
 		"Resetting sync wipes the current encryption key and orphans anything " +
