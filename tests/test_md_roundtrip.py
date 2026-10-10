@@ -23,3 +23,16 @@ def test_markdown_round_trips_unchanged():
         ["node", str(SCRIPT)], capture_output=True, text=True, timeout=60, check=False
     )
     assert run.returncode == 0, run.stdout + run.stderr
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+def test_clipboard_text_becomes_markdown_and_lands_in_place():
+    """Pasting a list made a paragraph per line; tests/js/clip.js pins the text side."""
+    run = subprocess.run(
+        ["node", str(SCRIPT.with_name("clip.js"))],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert run.returncode == 0, run.stdout + run.stderr

@@ -50,6 +50,10 @@ class VectorStore(ABC):
         """Re-embed one artifact's chunks in place; returns how many were indexed."""
 
     @abstractmethod
+    def chunks_indexed(self, artifact_id: str) -> bool:
+        """Whether the artifact's chunks are all indexed as they would be written now."""
+
+    @abstractmethod
     def index_facets_artifact(self, artifact_id: str) -> int:
         """Re-embed one artifact's facets in place; returns how many were indexed."""
 
@@ -73,6 +77,10 @@ class VectorStore(ABC):
 
         Each leg holds up to `prefetch` hits in its own rank order.
         """
+
+    @abstractmethod
+    def search_within(self, artifact_id: str, text: str, limit: int = 20) -> list[str]:
+        """Chunk ids of one artifact, best match for `text` first."""
 
     @abstractmethod
     def similar_chunks(self, chunk_id: str, limit: int = 10) -> list[dict]:

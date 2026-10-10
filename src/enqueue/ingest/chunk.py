@@ -214,14 +214,24 @@ def chunk_markdown(markdown: str) -> list[tuple[str, str]]:
     return chunks
 
 
-def chunk_artifact(conn, artifact_id: str) -> int:
-    """Rebuild chunks for one artifact. Derived data, so it is replaced wholesale."""
-    row = conn.execute(
-        "SELECT kind, title, body, filename FROM artifacts WHERE id = ?", (artifact_id,)
-    ).fetchone()
-    if row is None:
-        return 0
+def stored(conn, artifact_id: str) -> list[tuple[str, str]]:
+    """The artifact's chunks as stored, in order: (text, chunker) pairs."""
+    return [
+        (r["text"], r["chunker"])
+        for r in conn.execute(
+            "SELECT text, chunker FROM chunks WHERE artifact_id = ? ORDER BY ordinal",
+            (artifact_id,),
+        )
+    ]
 
+
+def chunk_artifact(conn, artifact_id: str, made: list[tuple[str, str]] | None = None) -> int:
+    """Rebuild chunks for one artifact. Derived data, so it is replaced wholesale.
+
+    `made` is the result of `plan` when the caller already has it.
+    """
+    if made is None:
+        made = plan(conn, artifact_id)
     # A chunk whose text survives the re-chunk keeps its model-written context
     # (ingest/context.py), so a reprocess or retry pays only for chunks that changed.
     kept_context = {
@@ -233,6 +243,23 @@ def chunk_artifact(conn, artifact_id: str) -> int:
         )
     }
     conn.execute("DELETE FROM chunks WHERE artifact_id = ?", (artifact_id,))
+    for ordinal, (text, chunker) in enumerate(made):
+        context, context_model = kept_context.get(text, (None, None))
+        conn.execute(
+            "INSERT INTO chunks (id, artifact_id, ordinal, text, chunker, context,"
+            " context_model) VALUES (?,?,?,?,?,?,?)",
+            (str(uuid.uuid4()), artifact_id, ordinal, text, chunker, context, context_model),
+        )
+    return len(made)
+
+
+def plan(conn, artifact_id: str) -> list[tuple[str, str]]:
+    """The chunks this artifact should have now, as (text, chunker) pairs. Writes nothing."""
+    row = conn.execute(
+        "SELECT kind, title, body, filename FROM artifacts WHERE id = ?", (artifact_id,)
+    ).fetchone()
+    if row is None:
+        return []
 
     # Notes carry their own text. A link carries whatever its preview found out, which
     # is the only reason fetching one is worth a network request at all: it turns a
@@ -299,17 +326,8 @@ def chunk_artifact(conn, artifact_id: str) -> int:
             body = name
 
     if not body.strip():
-        return 0
-
-    made = chunk_markdown(body)
-    for ordinal, (text, chunker) in enumerate(made):
-        context, context_model = kept_context.get(text, (None, None))
-        conn.execute(
-            "INSERT INTO chunks (id, artifact_id, ordinal, text, chunker, context,"
-            " context_model) VALUES (?,?,?,?,?,?,?)",
-            (str(uuid.uuid4()), artifact_id, ordinal, text, chunker, context, context_model),
-        )
-    return len(made)
+        return []
+    return chunk_markdown(body)
 
 
 def chunk_all() -> dict:

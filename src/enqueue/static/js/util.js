@@ -224,13 +224,10 @@ document.addEventListener("copy", (e) => {
 	const sel = document.getSelection();
 	const text = sel ? sel.toString() : "";
 	if (!text || !e.clipboardData) return;
-	let html = "";
-	if (sel.rangeCount) {
-		const wrap = document.createElement("div");
-		wrap.appendChild(sel.getRangeAt(0).cloneContents());
-		html = wrap.innerHTML;
-	}
-	e.clipboardData.setData("text/plain", text);
-	if (html) e.clipboardData.setData("text/html", html);
+	// A list keeps its shape on the way out (md.js clipOfRange): its items get their
+	// <ul>/<ol> back, and the plain text carries the markers, nesting and numbers.
+	const clip = sel.rangeCount ? clipOfRange(sel.getRangeAt(0)) : { html: "", text: null };
+	e.clipboardData.setData("text/plain", clip.text || text);
+	if (clip.html) e.clipboardData.setData("text/html", clip.html);
 	e.preventDefault();
 });

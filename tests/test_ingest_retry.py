@@ -228,3 +228,131 @@ def test_a_run_that_still_owes_keeps_the_row(provider, monkeypatch):
     q.process(aid)
 
     assert _retry_row(aid) is not None
+
+
+def _due(aid: str) -> None:
+    with db.transaction() as conn:
+        conn.execute(
+            "INSERT INTO facet_retry (artifact_id, attempts, next_at, last_error)"
+            " VALUES (?, 0, '2000-01-01T00:00:00+00:00', 'SummariesOwed: paused')",
+            (aid,),
+        )
+
+
+def _quiet_steps(monkeypatch, during=None):
+    """No model step has anything to do; `during` runs in the middle of the run."""
+    for step in ("_sections_artifact", "_facet_artifact"):
+        monkeypatch.setattr(q, step, lambda _aid: 0)
+    monkeypatch.setattr(q, "_entities_artifact", lambda _aid: during() if during else 0)
+
+
+def test_a_sweep_during_a_retry_run_does_not_queue_it_again(provider, monkeypatch):
+    # The live loop: a long document's run outlasts the 30s sweep. The sweeper saw a due
+    # row and nothing queued (the worker had taken the item), queued a second copy, and
+    # the run then left the row alone because a newer copy was waiting. Forever.
+    import threading
+
+    aid = _note("A long document whose run takes longer than one sweep.")
+    _due(aid)
+    provider(lambda model, user: {})
+    monkeypatch.setattr(q, "submit_background", q._queue)
+    swept: list[list[str]] = []
+
+    def sweep():  # the sweeper has its own thread
+        t = threading.Thread(target=lambda: swept.append(q._sweep_due()))
+        t.start()
+        t.join()
+        return 0
+
+    _quiet_steps(monkeypatch, during=sweep)
+    q._dequeue(aid, q._queue(aid))  # what the worker does before the run
+    try:
+        q.process(aid)
+        assert swept == [[]]
+        assert _retry_row(aid) is None
+    finally:
+        q._queued.pop(aid, None)
+        del q._running.item
+
+
+def test_a_run_never_leaves_a_retry_due_in_the_past(provider, monkeypatch):
+    from datetime import datetime, timezone
+
+    aid = _note("An edit lands while the retry runs.")
+    _due(aid)
+    provider(lambda model, user: {})
+    _quiet_steps(monkeypatch, during=lambda: q._queue(aid) and 0)  # a newer copy is queued
+    q._dequeue(aid, q._queue(aid))
+    try:
+        q.process(aid)
+        row = _retry_row(aid)  # the newer copy settles it; until then it is not due
+        assert row is not None and row["next_at"] > datetime.now(timezone.utc).isoformat()
+        assert q._sweep_due() == []
+    finally:
+        q._queued.pop(aid, None)
+        del q._running.item
+
+
+def test_a_failed_run_does_not_leave_the_retry_due(provider, monkeypatch):
+    from datetime import datetime, timezone
+
+    aid = _note("The database is busy.")
+    _due(aid)
+
+    def locked(_aid):
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(q, "_process", locked)
+    with pytest.raises(RuntimeError):
+        q.process(aid)
+
+    assert _retry_row(aid)["next_at"] > datetime.now(timezone.utc).isoformat()
+
+
+def _chunk_ids(aid):
+    conn = db.get_conn()
+    try:
+        return [
+            r["id"]
+            for r in conn.execute(
+                "SELECT id FROM chunks WHERE artifact_id = ? ORDER BY ordinal", (aid,)
+            )
+        ]
+    finally:
+        conn.close()
+
+
+def test_a_retry_does_not_rechunk_or_reembed_unchanged_text(provider, monkeypatch):
+    from enqueue import events
+    from enqueue.index import store_sqlite
+
+    aid = _note("\n\n".join(f"## Part {i}\n\n" + f"Detail {i}. " * 150 for i in range(3)))
+    provider(lambda model, user: {})
+    _quiet_steps(monkeypatch)
+    monkeypatch.setattr(q, "_context_artifact", lambda _aid: 0)
+    first = q.process(aid)
+    ids = _chunk_ids(aid)
+    assert first["chunks"] == len(ids) >= 3
+
+    embedded: list[int] = []
+    real = store_sqlite.embed
+    monkeypatch.setattr(
+        store_sqlite, "embed", lambda texts: embedded.append(len(texts)) or real(texts)
+    )
+    logged = len([e for e in events.recent(50) if e["kind"] == "ingest"])
+
+    again = q.process(aid)
+
+    assert again["chunks"] == len(ids) and _chunk_ids(aid) == ids
+    assert embedded == []
+    assert len([e for e in events.recent(50) if e["kind"] == "ingest"]) == logged
+
+    with db.transaction() as conn:  # the title is index text: a rename is re-indexed
+        conn.execute("UPDATE artifacts SET title = 'Renamed' WHERE id = ?", (aid,))
+    q.process(aid)
+    assert embedded == [len(ids)]
+
+    with db.transaction() as conn:  # and so is a body that changed
+        conn.execute("UPDATE artifacts SET body = body || '\n\nA new ending.' WHERE id = ?", (aid,))
+    q.process(aid)
+    assert _chunk_ids(aid) != ids and len(embedded) == 2

@@ -581,20 +581,56 @@ document.addEventListener("visibilitychange", refreshIfStale);
 // #c/<id> = chat, #g = saved-groupings list,
 // #g/<id> = a saved grouping run, #s/<query> = search results.
 function setRoute(token) {
+	navArrive(token || "");
 	const want = token ? "#" + token : "";
 	if (location.hash === want) return;
-	// replaceState, not location.hash: the app's own pill is the back button,
-	// and browser-history entries for every artifact would make Back a broken
-	// walk through views that never re-render. There is no hashchange listener
-	// - a second window driving the same page is not a scenario today.
+	// replaceState, not location.hash: browser-history entries for every artifact
+	// would make the browser's own Back a walk through views that never re-render.
+	// The way back is the app's (goBack, below). There is no hashchange listener -
+	// a second window driving the same page is not a scenario today.
 	history.replaceState(null, "", want || location.pathname + location.search);
 }
 
-// Boot reads the hash and restores the view that was open when the page was
-// reclaimed, so a hidden-and-restored window never lands on the wall while an
-// artifact was open. Anything unrecognized falls back to the wall.
-function restoreRoute() {
-	const raw = location.hash.replace(/^#/, "");
+// ---- the way back -------------------------------------------------------
+// The back button on a page goes to the page you came from, not to the wall: tags
+// -> books -> a note -> back used to land on the wall, and the pill already has a
+// home button for that. Every navigation passes through setRoute, so the trail is
+// kept there: the route tokens you came through, each with where it was scrolled.
+// Arriving on the wall starts the trail over (nothing is behind the wall). It lives
+// in sessionStorage so a webview macOS reclaimed still knows the way back.
+const NAV_KEY = "enqueue.navTrail";
+let navTrail = [];
+try {
+	navTrail = JSON.parse(sessionStorage.getItem(NAV_KEY) || "[]");
+	if (!Array.isArray(navTrail)) navTrail = [];
+} catch (_) {
+	navTrail = [];
+}
+let navAt = location.hash.replace(/^#/, "");
+let navReturning = false;
+// Where the page was scrolled when the person last acted: a view is torn down
+// before its successor sets the route, and by then the scroll is gone.
+let navY = 0;
+for (const kind of ["pointerdown", "keydown"])
+	document.addEventListener(kind, () => (navY = window.scrollY), true);
+
+function navArrive(token) {
+	if (token === navAt) return;
+	if (!navReturning) {
+		if (token === "") navTrail = [];
+		else navTrail.push({ token: navAt, y: navY });
+		if (navTrail.length > 50) navTrail.shift();
+	}
+	navAt = token;
+	try {
+		sessionStorage.setItem(NAV_KEY, JSON.stringify(navTrail));
+	} catch (_) {
+		// A full or disabled store only costs the trail across a reload.
+	}
+}
+
+// Open the view a route token names. Anything unrecognized is the wall.
+function openRoute(raw) {
 	if (!raw) return home();
 	const [kind, ...rest] = raw.split("/");
 	const id = rest.join("/");
@@ -614,6 +650,49 @@ function restoreRoute() {
 	if (kind === "untagged" && !id) return showUntagged();
 	if (kind === "settings" && !id) return showSettings();
 	return home();
+}
+
+// Go back one page, to where it was scrolled. With nothing behind, the wall.
+async function goBack() {
+	const prev = navTrail.pop();
+	if (!prev) return home();
+	navReturning = true;
+	try {
+		await openRoute(prev.token);
+	} finally {
+		navReturning = false;
+		navArrive(prev.token);
+	}
+	requestAnimationFrame(() => window.scrollTo(0, prev.y || 0));
+}
+
+// What the back button says: the page it goes to.
+function backLabel() {
+	const prev = navTrail[navTrail.length - 1];
+	const token = prev ? prev.token : "";
+	if (!token) return "Everything";
+	const [kind, ...rest] = token.split("/");
+	const id = rest.join("/");
+	if (kind === "s" && id) {
+		let q = id;
+		try {
+			q = decodeURIComponent(id);
+		} catch (_) {
+			// Shown as it is.
+		}
+		return q.length > 28 ? q.slice(0, 27) + "\u2026" : q;
+	}
+	if (kind === "g") return id ? "View" : "Views";
+	if (kind === "untagged") return "Untagged";
+	if (kind === "settings") return "Settings";
+	return "Back";
+}
+
+// Boot reads the hash and restores the view that was open when the page was
+// reclaimed, so a hidden-and-restored window never lands on the wall while an
+// artifact was open. Anything unrecognized falls back to the wall.
+function restoreRoute() {
+	return openRoute(location.hash.replace(/^#/, ""));
 }
 
 // One order, always: what you touched last. The bar of alternatives was three

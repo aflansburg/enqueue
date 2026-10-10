@@ -309,6 +309,15 @@ class Answer(BaseModel):
         return self
 
 
+class Standalone(BaseModel):
+    """A follow-up restated so it can be searched for without the conversation."""
+
+    question: str = Field(min_length=1, description="The latest message as one question.")
+    claims: list[str] = Field(
+        default_factory=list, description="2 to 4 general claims the question is after."
+    )
+
+
 class ChatTitle(BaseModel):
     """What a conversation gets called in the list of conversations."""
 

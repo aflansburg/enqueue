@@ -81,14 +81,51 @@ def _clear_facet_retry(conn, artifact_id: str) -> None:
     conn.execute("DELETE FROM facet_retry WHERE artifact_id = ?", (artifact_id,))
 
 
+def _defer_due_retry(conn, artifact_id: str) -> None:
+    """Move a retry that is still due to the first backoff step, without counting an
+    attempt. A run that could not settle the row (a newer copy of the artifact is
+    queued and will, or the run itself failed) must not leave it due, or the sweeper
+    queues the artifact again at every pass."""
+    now = datetime.now(timezone.utc)
+    conn.execute(
+        "UPDATE facet_retry SET next_at = ? WHERE artifact_id = ? AND next_at <= ?",
+        (
+            (now + timedelta(seconds=_FACET_RETRY_BASE)).isoformat(),
+            artifact_id,
+            now.isoformat(),
+        ),
+    )
+
+
+def _settle_retry(artifact_id: str, clear: bool) -> None:
+    """End a run with the retry row either gone or due in the future. Never raises."""
+    from .. import db
+
+    try:
+        with db.transaction() as conn:
+            if clear:
+                _clear_facet_retry(conn, artifact_id)
+            else:
+                _defer_due_retry(conn, artifact_id)
+    except Exception:  # noqa: BLE001 - bookkeeping; must not mask the run's own outcome
+        log.exception("could not settle the retry row for %s", artifact_id)
+
+
 def _sweep_due() -> list[str]:
-    """Submit the artifacts whose retry is due and are not already waiting in the queue.
+    """Submit the artifacts whose retry is due and are neither waiting in the queue nor
+    being processed right now.
 
     A due row's next_at only moves once the worker processes the artifact, so while the
     worker is busy (a startup backfill, a full re-summarize) the row stays due. Without
     the pending check every 30s sweep queued it again, and a half-hour busy spell left
     dozens of copies that then ran back to back - each re-chunking and re-embedding the
     whole artifact, and each skipping the summary because a newer copy was still queued.
+
+    The artifact the worker is on counts too: it has left the queue, and its row only
+    moves when the run ends. A run longer than one sweep (a long document) used to get
+    a second copy queued behind it, which made the run skip every model step and leave
+    the row alone, so the next sweep did the same to that copy, about once a minute for
+    as long as the engine ran.
     Returns the ids submitted.
     """
     from .. import db
@@ -107,7 +144,7 @@ def _sweep_due() -> list[str]:
         ]
     finally:
         conn.close()
-    submitted = [aid for aid in due if _pending(aid) == 0]
+    submitted = [aid for aid in due if _pending(aid) == 0 and not _in_flight(aid)]
     for aid in submitted:
         submit_background(aid)
     return submitted
@@ -152,6 +189,7 @@ _queued: dict[str, list[int]] = {}
 _queued_lock = threading.Lock()
 _submitted = itertools.count(1)
 _running = threading.local()  # (artifact_id, number) of the item this thread is on
+_processing: set[str] = set()  # artifacts inside `process` right now, for other threads
 
 
 def _queue(artifact_id: str) -> int:
@@ -187,25 +225,35 @@ def _pending(artifact_id: str) -> int:
         return len(numbers)
 
 
+def _in_flight(artifact_id: str) -> bool:
+    """Whether a run of this artifact is under way (on any thread)."""
+    with _queued_lock:
+        return artifact_id in _processing
+
+
 def process(artifact_id: str) -> dict:
     """Resolve, extract, chunk, and index one artifact. Synchronous.
 
     Each model step skips work that is already current, and any step that fails for
     a reason that will pass (rate limit, outage) owes the artifact a retry; the
     retry sweeper re-runs the whole artifact, which then costs only the owed steps.
-    """
-    from .. import db
 
+    However the run ends, the artifact's retry row is either gone (no step owed and no
+    newer copy is queued) or due in the future: a row left due is queued again by
+    every sweep.
+    """
     _owed_in_run.discard(artifact_id)
-    result = _process(artifact_id)
-    if artifact_id not in _owed_in_run and _pending(artifact_id) == 0:
-        conn = db.get_conn()
-        try:
-            _clear_facet_retry(conn, artifact_id)
-            conn.commit()
-        finally:
-            conn.close()
-    return result
+    with _queued_lock:
+        _processing.add(artifact_id)
+    settled = False
+    try:
+        result = _process(artifact_id)
+        settled = artifact_id not in _owed_in_run and _pending(artifact_id) == 0
+        return result
+    finally:
+        _settle_retry(artifact_id, clear=settled)
+        with _queued_lock:
+            _processing.discard(artifact_id)
 
 
 def _process(artifact_id: str) -> dict:
@@ -262,14 +310,28 @@ def _process(artifact_id: str) -> dict:
     # unsearchable; the capture itself already succeeded.
     described = _describe_image_if_needed(artifact_id)
 
-    # Re-chunking gives every chunk a new id, and an index row can only be found
-    # through its chunk, so the old rows are dropped while the old chunks still exist.
+    # A run whose chunks would come out exactly as they are stored, and are indexed as
+    # they would be now, keeps them: a retry that only owes a model step, a sync
+    # re-apply, a reprocess of unchanged text. Re-chunking took the artifact out of
+    # search while every chunk was embedded again.
     store = get_store()
-    store.drop_artifact(store.CHUNKS, artifact_id)
-    with db.transaction() as conn:
-        chunks = chunk_mod.chunk_artifact(conn, artifact_id)
+    conn = db.get_conn()
+    try:
+        made = chunk_mod.plan(conn, artifact_id)
+        kept = bool(made) and chunk_mod.stored(conn, artifact_id) == made
+    finally:
+        conn.close()
+    kept = kept and store.chunks_indexed(artifact_id)
 
-    indexed = store.index_artifact(artifact_id) if chunks else 0
+    if kept:
+        chunks = indexed = len(made)
+    else:
+        # Re-chunking gives every chunk a new id, and an index row can only be found
+        # through its chunk, so the old rows are dropped while the old chunks still exist.
+        store.drop_artifact(store.CHUNKS, artifact_id)
+        with db.transaction() as conn:
+            chunks = chunk_mod.chunk_artifact(conn, artifact_id, made)
+        indexed = store.index_artifact(artifact_id) if chunks else 0
     if not chunks:
         # An artifact can lose its text: a note emptied, a preview refetched and
         # failed. Its stale points have to go, or search keeps returning it.
@@ -326,9 +388,10 @@ def _process(artifact_id: str) -> dict:
             log.exception("section index failed for %s", artifact_id)
 
     # An ingest that produced nothing (an artifact with no extractable text re-applied
-    # by a sync) is not activity worth a row - logging every one buries the questions
-    # and captures a person actually cares about. Only record an ingest that did work.
-    if not (chunks or facets_made or entities_made):
+    # by a sync, a retry that found its chunks as they were and nothing to write) is not
+    # activity worth a row - logging every one buries the questions and captures a
+    # person actually cares about. Only record an ingest that did work.
+    if not ((chunks and not kept) or facets_made or entities_made or contexts_made):
         return {
             "artifact_id": artifact_id,
             "pages": pages,

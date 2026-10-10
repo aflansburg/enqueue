@@ -254,6 +254,6 @@ def test_the_sweeper_leaves_an_artifact_already_waiting_in_the_queue(store, quie
         assert quiet_queue == []
     finally:
         q._dequeue(aid)
-    # Once it has been picked up, a still-due row is swept again as before.
+    # Once that copy is gone and no run is under way, a still-due row is swept again.
     assert q._sweep_due() == [aid]
     assert quiet_queue == [aid]

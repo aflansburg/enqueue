@@ -525,6 +525,14 @@
 <script src="/static/js/md.js"></script>
 <script src="/static/js/ground.js"></script>
 <script>
+  // md.js's md() escapes input via this helper (util.js on the desktop home, which
+  // this page does not load). Pasting renders markdown, so it is provided here.
+  function esc(s) {
+    return (s ?? "").replace(
+      /[&<>"']/g,
+      (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c],
+    );
+  }
   const card = document.getElementById("card");
   const bar = document.getElementById("bar");
   const field = document.getElementById("field");
@@ -960,7 +968,14 @@
       .filter((item) => item.kind === "file" && item.type.startsWith("image/"))
       .map((item) => item.getAsFile())
       .filter(Boolean);
-    if (!images.length) return;
+    if (!images.length) {
+      // Text with lines or a list goes in as markdown (md.js clipToMd / pasteMd), the
+      // same as in the note editor, so a pasted list is one list here too.
+      const cd = event.clipboardData;
+      const clip = clipToMd((cd && cd.getData("text")) || "", (cd && cd.getData("text/html")) || "");
+      if (clip.blocks && pasteMd(field, clip.src)) event.preventDefault();
+      return;
+    }
 
     event.preventDefault();
     busy(true);

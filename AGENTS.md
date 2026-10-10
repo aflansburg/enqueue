@@ -232,7 +232,7 @@ One line per file, describing its job.
 
 | File | Job |
 | --- | --- |
-| `ingest/queue.py` | In-memory work queue. One daemon thread. `submit()` returns immediately. Model steps run sections -> facets -> entities -> contexts; each skips work already current (facets/entities written by the current ingest model from the current body; contexts only for chunks missing one, and `chunk_artifact` carries contexts over unchanged chunk text), and a transient failure in any of them (`source.Owed`) owes the artifact a `facet_retry`, so a rate-limited reprocess finishes itself later at the cost of only what was missing. "Rebuild concepts" is how to force facets with the same model. A vision describe failure marks the image `status='failed'` and surfaces in `/doctor` (`images_without_body`) instead of failing silently. |
+| `ingest/queue.py` | In-memory work queue. One daemon thread. `submit()` returns immediately. Model steps run sections -> facets -> entities -> contexts; each skips work already current (facets/entities written by the current ingest model from the current body; contexts only for chunks missing one, and `chunk_artifact` carries contexts over unchanged chunk text), and a transient failure in any of them (`source.Owed`) owes the artifact a `facet_retry`, so a rate-limited reprocess finishes itself later at the cost of only what was missing. "Rebuild concepts" is how to force facets with the same model. Chunks that would come out unchanged and are already indexed are kept, not re-chunked and re-embedded, and every run leaves its `facet_retry` row gone or due in the future (see Gotchas). A vision describe failure marks the image `status='failed'` and surfaces in `/doctor` (`images_without_body`) instead of failing silently. |
 | `ingest/chunk.py` | Markdown chunker. Headings, lists, code fences kept whole. Prose merged to a floor. Anything over `CHUNK_MAX_TOKENS` (counted with the embedder's own tokenizer) is split at line, then sentence, then word boundaries. Chunk source includes the artifact's current annotation text; a bodyless capture falls back to its title + filename so it always has at least one chunk. |
 | `ingest/facets.py` | Facet generation via the summary provider, fed page_text + annotations. Eligibility gate, proper-noun self-reference check, retry/backoff. Also the user-edit surface: `edit_facet`/`add_facet`/`delete_facet`/`regenerate` + `sync_facets` (push to other devices). |
 | `ingest/source.py` | The text every ingest writer reads: `ingest_text()` = the body (notes) or extracted `page_text` (links, PDFs, images), plus current annotations marked "(your note)". A document over `FACET_INPUT_CHARS` is map-reduced: split into sections of up to 10k characters on paragraph boundaries (at most 24), each summarized by the ingest model (cached in `derived_values`, scope `section_summary`, per section hash and model), and read as ordered summaries. The summaries are also written to `sections` (stamped with ingest model and body version; left untouched when unchanged, since facets, entities and contexts each read through here) and indexed as their own search layer by the ingest queue. A section that fails for a reason that will pass (rate limit, outage; `providers.base.is_transient`) raises `SummariesOwed` so the artifact is retried instead of written from its opening; any other failure falls back to the capped opening; `text_only` text is never mapped. Facets, entities and chunk contexts all read through it. |
@@ -348,7 +348,7 @@ One line per file, describing its job.
 2. **Generate** (`ingest/facets.py` `generate_for_artifact`): feeds the model the artifact's page_text (not just the body, capped at `FACET_INPUT_CHARS`) PLUS its annotations marked "(your note)", so a person's notes shape the summary. Calls `get_provider(summarize=True)` (the summary model), stores facets stamped with `provider.model` and a trust derived from the model's confidence. DELETE-before-insert only removes rows `WHERE edited=0`, preserving hand-edited lines.
 3. **Index** (`index/store_sqlite.py`): `index_facets_artifact()` embeds facet statements, upserts into `vec_facets` and `fts_facets`. Search drops a facet whose `model_version` no longer matches the active summary model, so switching models never surfaces stale summaries.
 
-**Re-summarizing after a summary-model switch runs on the ingest worker.** Search only uses facets from the active summary model, so a switch empties the conceptual layer until the library is re-summarized. `backfill_summaries()` (every startup) queues every live item whose facets are not `facets.is_current` - none, another model, or an older body - so a switch finishes on its own across restarts. "Rebuild concepts" / `POST /facets` / `enq facets` call `queue_summary_refresh(redo)`, which queues the same set (or, with `redo`, every item, forced via `facets.force`) and returns at once; it used to run `generate_all` inside the request for hours, which a restart killed. `enq doctor` reports `summaries: {model, current, stale, retrying}`. The retry sweeper (`_sweep_due`) never re-queues an artifact already waiting in the queue: a due row only moves once the worker processes it, and re-queuing it every 30s while the worker was busy produced bursts of back-to-back re-ingests ("33 chunks, 0 facets" every ~13s).
+**Re-summarizing after a summary-model switch runs on the ingest worker.** Search only uses facets from the active summary model, so a switch empties the conceptual layer until the library is re-summarized. `backfill_summaries()` (every startup) queues every live item whose facets are not `facets.is_current` - none, another model, or an older body - so a switch finishes on its own across restarts. "Rebuild concepts" / `POST /facets` / `enq facets` call `queue_summary_refresh(redo)`, which queues the same set (or, with `redo`, every item, forced via `facets.force`) and returns at once; it used to run `generate_all` inside the request for hours, which a restart killed. `enq doctor` reports `summaries: {model, current, stale, retrying}`. The retry sweeper (`_sweep_due`) never re-queues an artifact already waiting in the queue or being processed (`_in_flight`): a due row only moves once the worker processes it, and re-queuing it every 30s while the worker was busy produced bursts of back-to-back re-ingests ("33 chunks, 0 facets" every ~13s). See "A retry run settles its row" under Gotchas.
 
 **Editing the summary (facets are user-editable).** `ingest/facets.py` exposes `edit_facet(facet_id, statement)` (marks `edited=1`, full trust, reindexes), `add_facet(artifact_id, statement, level)`, `delete_facet(facet_id)`, and `regenerate(artifact_id)` (clears skip/retry, regenerates machine lines, keeps edited ones). Each is wired to an endpoint (`PATCH /facets/{id}`, `POST /artifacts/{id}/facets`, `DELETE /facets/{id}`, `POST /artifacts/{id}/facets/regenerate`) and to a mobile Tauri command (`mobile_facet_edit`, `mobile_facet_delete`). An edit bumps the artifact's `updated_at` and pushes so it wins LWW and reaches the other device; a background generation pushes without bumping (equal-key re-apply carries the new facets to the phone). The `facets.edited` column (migration `0031_facet_edited`) is what regeneration reads to decide which rows it may delete.
 
@@ -370,8 +370,8 @@ organises material into views through `POST /pivot/plan` and `POST /pivot/run`.
 Asking is submitted, not computed inline. `chats.ask`/`chats._submit` writes the user turn plus a pending assistant turn in one transaction, logs `ask.submitted`, and hands the work to the answer worker (`chats_worker.py`, an in-memory `Worker` thread); the request returns immediately with a visible pending turn. On startup `sweep_orphaned_pending` resolves any turn left pending by a killed worker to `failed` (Rule 2: a pending turn always resolves).
 
 `chats_worker.compute(job)`:
-1. **Route** (`assistant.route`): pick the skill (an LLM call unless a skill is forced).
-2. **Answer** (`chats.py` via the skill): retrieve passages (scoped chats do not search; everything-scope uses hybrid search on chunks + facet hits) and have the model answer from them. `Answer` schema enforces grounded/cited consistency. The passage header MUST carry the artifact id (`[kind] (id: <id>) title`): the validator rejects any cited id it was not offered, so if the model only sees the title it cites the title and the turn fails validation as "cited artifacts that were not provided" (CHATBUG.1).
+1. **Route** (`assistant.route`): pick the skill. A request with no word for rearranging (`_ORGANIZE_CUE`: organize, group, sort, arrange, cluster, categorize, classify, bucket) is `answer` with no model call; only one that has such a word asks the model. The call used to run before every answer and said `answer` nearly every time.
+2. **Answer** (`chats.py` via the skill): restate a follow-up so it can be searched (`_standalone`), retrieve passages (a scoped chat reads its artifact, searched inside when it is long; everything-scope uses hybrid search on chunks + facet hits) and have the model answer from them. `Answer` schema enforces grounded/cited consistency. The passage header MUST carry the artifact id (`[kind] (id: <id>) title`): the validator rejects any cited id it was not offered, so if the model only sees the title it cites the title and the turn fails validation as "cited artifacts that were not provided" (CHATBUG.1).
 3. **Commit** via `_commit_answer`, which retries a transient `database is locked` a few times so a busy moment (a sync applying a batch) does not throw away a real answer.
 4. **Title + topics** (`chats.py`): best-effort, non-blocking, after the answer commits. Topics regenerated from whole transcript each turn.
 5. **Log + push**: emit `ask.answered` (question, answer, cited artifacts, `model`, per-stage timing) or `ask.failed` (with the error), and push the conversation to the relay.
@@ -499,6 +499,7 @@ A database that predates Alembic (created by the old `schema.sql`) is stamped at
 | `ENQ_TRASH_DAYS` | `30` | Trash retention window in days |
 | `ENQ_SEARCH_MODEL_RANK` | `off` | The `search_model_rank` setting: the search model re-orders the top 20 results of `/search` (`retrieve/model_rank.py`). |
 | `ENQ_SEARCH_JUDGE_WAIT` | `2.5` | Seconds `/search` waits for the gray-zone judge before answering without it. |
+| `ENQ_CHAT_PREP_WAIT` | `8` | Seconds an answer waits for the search model to restate a follow-up or lift a question before retrieving without it. |
 | `ENQ_SEARCH_RERANK` | off | Opt-in cross-encoder rerank of the top fused search candidates (R.9). Off by default; measured net-neutral on the golden set. |
 
 ### Where secrets live
@@ -755,7 +756,7 @@ Fuse with RRF (canonical k=60, M.5g), apply the R.8 recency multiplier, optional
 
 ### The relevance floor (Q.3, in progress)
 
-Dense kNN always returns a nearest neighbor however far, so a no-match query would return a wall. The floor is a two-tier gate on the raw legs (not the fused score): any lexical leg or `dense_similarity >= KEEP_ABOVE` keeps; `< DROP_BELOW` drops; the gray zone is settled by one batched model judgment (`judge_gray_zone`), failing open. A search with zero survivors returns `[]`. `chats.passages()` applies the same `_floor_verdict` gate (Q.5 chunks, Q.10 facets/entities) so the answer path refuses honestly. Calibration (the two constants + the gray-zone judge) is the active work in `docs/PLAN.md` Phase Q.
+Dense kNN always returns a nearest neighbor however far, so a no-match query would return a wall. The floor is a two-tier gate on the raw legs (not the fused score): any lexical leg or `dense_similarity >= KEEP_ABOVE` keeps; `< DROP_BELOW` drops; the gray zone is settled by one batched model judgment (`judge_gray_zone`), failing open. A search with zero survivors returns `[]`. `chats.passages()` applies the same `_floor_verdict` gate (Q.5 chunks, Q.10 facets/entities) without the judge call: below the floor is dropped, the gray zone is left to the answering model (see "The judge never holds a search"). Calibration (the two constants + the gray-zone judge) is the active work in `docs/PLAN.md` Phase Q.
 
 ### Retrieval design notes
 
@@ -821,7 +822,14 @@ Fusion alone does not honour a typed name: "The good life" ranked the note calle
 `_apply_floor` waits `config.SEARCH_JUDGE_WAIT_S` (2.5s, `ENQ_SEARCH_JUDGE_WAIT`) for the gray-zone judge (`_judge_in_time`); past that the search answers from cached verdicts, keeps what was never judged as `loose` (shown last, under the page's line that says so), and the judge finishes in the background and caches, so the same search is exact next time.
 At most two judges run on past their search (`_JUDGES`); a search that finds both busy answers without one.
 A thinking model with reprompts once held a search for an exact title for 94 seconds.
-Chat's passages still wait for the judge: an answer is computed off the request anyway.
+Chat does not call the judge at all (2026-10-10): its gray zone goes to the answering model, which reads every passage and is told to refuse when none fits, so a judge before it was the same model ruling twice on less text, for one or two more round trips per answer.
+`chats._library_passages` still drops below `DROP_BELOW` and still honours a verdict `/search` has cached (`_cached_verdicts`: a cached "no" drops the passage).
+
+**A cross-encoder cannot be the judge (measured 2026-10-10).**
+Three local rerankers were scored on every floor survivor of both evals and a real library: ms-marco-MiniLM-L-6 (80 MB, ~0.2 s a search), jina-reranker-v1-tiny (130 MB) and bge-reranker-base (1 GB, 2 to 6 s a search on CPU, slower than the model judge's wait).
+All three score the cross-domain targets exactly like noise (MiniLM: targets -11.5 to -10.6, hits of "nothing" queries -11.4 to -11.1), because a cross-encoder reads shared words and the cross-domain suite is built to share none; used to drop, any of them deletes the matches the facet layer exists to find.
+MiniLM can only confirm: no hit of a "nothing" query scored above -11.14, and 37 of 44 real matches did.
+That would settle a few hits per search early and still leave the rest to the model judge, so it was not built: a third relevance mechanism for a small gain.
 
 **Fuzzy leg (R.7).**
 `FUZZY_BASE_SCORE = 0.02` sits between a single-leg rank-1 RRF hit (~0.016) and a dual-leg one (~0.033), so a typo match wins only when the hybrid was weak.
@@ -840,11 +848,27 @@ The cross-encoder runs on CPU only: a second CoreML model in the process leaks c
 
 **Staleness.**
 A facet or entity hit counts only while its `body_version` matches the artifact's latest `artifact_versions` row and its `model_version` matches the current SUMMARY model (not the chat model; keying it to the chat model once voided every facet on a chat-model swap).
+A line the person wrote or rewrote (`facets.edited`) is never stale: `add_facet` stamps it `model_version = 'edited'`, which matched no model, so hand-written lines never counted in search until `hit_is_stale` learned to pass them.
 
 **Chat passages.**
-At most `CHUNKS_PER_ARTIFACT` chunks per note so one long note cannot take the whole `PASSAGES` budget (the "do I have notes on a president" case).
+The budget follows the answering model (`chats._budget`): a model on this machine gets `PASSAGES` (8) passages clipped to `PASSAGE_WORDS` (220), because a local 8B model given more summarizes instead; a hosted one gets `REMOTE_PASSAGES` (20) at `REMOTE_PASSAGE_WORDS` (400), which is every chunk whole.
+At most `CHUNKS_PER_ARTIFACT` chunks per note so one long note cannot take the whole budget (the "do I have notes on a president" case).
 A facet or entity hit pulls its artifact's opening chunk in, so the answer has literal text to stand on.
-A scoped chat does no retrieval: the artifact is the candidate set.
+A scoped chat reads its artifact whole when it fits the budget, with no search.
+One that does not fit (26% of one real library's artifacts, up to 81 chunks) used to be cut to its first 8 chunks, so nothing past the opening pages could be answered.
+`_scoped_passages` now gives the answer the document in brief (`_overview`: its current section summaries, else its current summary lines, as one passage with id `overview:<artifact id>`), its opening chunk, and the chunks that best match the question (`store.search_within`: the artifact's own vectors against the query plus the keyword leg kept to its chunks, RRF), in document order.
+An artifact not indexed yet falls back to its opening.
+
+**A follow-up is searched as the question it stands for (`chats._standalone`).**
+"What about the second one?" used to be searched for as those words: the conversation reached the answering model but never the search.
+On any turn after the first, the search model reads the last `REWRITE_TURNS` (6) turns and the new message and returns the message as one self-contained question (`prompts.CHAT_REWRITE`, `schemas.Standalone`), together with the lifted claims for it, which are stored in the lift cache so retrieval does not ask again.
+Retrieval runs on that question; the answering model still gets the message as typed, with the conversation above it.
+A chat scoped to a local-only artifact restates with the local model.
+
+**An answer's model calls.**
+A first question costs two calls before it lands: the lift (search model) and the answer (chat model). It used to cost up to five: the router, the lift, a judge for gray chunks, a judge for gray summary hits, the answer.
+A follow-up costs the same two: the restating call replaces the lift.
+Both preparation calls run on a thread beside local retrieval and are waited for `config.CHAT_PREP_WAIT_S` at most (8s, `ENQ_CHAT_PREP_WAIT`, `chats._background`); past that, retrieval goes on without the claims, a short follow-up (under `SHORT_FOLLOW_UP_WORDS`) is searched together with the question before it, and the call finishes unattended and caches what it can.
 A two-sided question is searched per side and interleaved (`retrieve/decompose.py`), because one embedding of "X vs Y" lands on whichever side dominates.
 
 ### Cross-domain eval
@@ -870,7 +894,7 @@ Its blind spot: a person only opens what search already showed, so it measures r
 
 | Scope | Retrieval |
 | --- | --- |
-| One artifact | none. The artifact fits in context. |
+| One artifact | none when it fits the passage budget; searched inside when it does not. |
 | Everything | full pipeline |
 
 ---
@@ -1156,6 +1180,17 @@ Ingest skips a trashed, vaulted or embedded artifact instead of chunking it back
 `enq doctor` compares the chunk index with `indexable_chunk_count` (chunks of live artifacts), not every chunk.
 A full rebuild and the prune run on the ingest worker's thread between two artifacts (`Worker.run_exclusive`, ahead of anything queued): run beside ingest they fought it for SQLite's single writer, failed with "database is locked", and left the index half-built with search blocked.
 
+### A retry run settles its row, and unchanged chunks are kept
+
+`queue.process` ends every run with the artifact's `facet_retry` row either deleted (no step owed, no newer copy queued) or due in the future (`_settle_retry`, in a `finally`, so a run that raised is covered too).
+A row left due is queued again by every 30s sweep.
+That happened for a week-limit leftover on an 81-chunk link (2026-10-09): its run took longer than one sweep, the sweeper saw a due row and an empty queue (the worker had already taken the item, and `_pending` from another thread counts queued copies only), and queued a second copy.
+The newer copy made the running one skip every model step and leave the row alone, and the next sweep did the same to that copy: one full re-chunk and re-embed a minute, 887 "81 chunks, 0 facets" rows, the note out of search for part of each minute.
+So the sweeper also skips the artifact being processed (`_in_flight`, set for the length of `process`), and a run that cannot settle the row itself pushes a due one out by 30s without counting an attempt (`_defer_due_retry`).
+Separately, a run whose chunks would come out exactly as stored (`chunk.plan` equals `chunk.stored`) and are indexed as they would be written now (`store.chunks_indexed`: a vector and a trigram row each, and the keyword row holding today's title, context and text) keeps them: no drop, no new chunk ids, no embedding.
+A retry that only owes a model step, a sync re-apply and a reprocess of unchanged text now cost a comparison, and such a run writes no `ingest` Activity row unless a step wrote something.
+A body, annotation, title or context change still re-chunks or re-indexes as before.
+
 ### A link whose page has no article is fetched once
 
 `preview.needs_fetch` lets an old link heal itself: a preview that succeeded but kept no article body is fetched again on its next pass through ingest.
@@ -1171,6 +1206,16 @@ Only where the panel sits is per app: `.drawer` in `css/artifact.css`, `.details
 The phone's root carries `data-touch`, which swaps the size variables at the top of the file, shows the controls a pointer reveals on hover, gives the remove a 44px target and lets the summary scroll with the panel.
 Change the panel in the shared files, never in one app's stylesheet: the phone's copy had been rewritten by hand to match the desktop's and would have drifted.
 On the phone the sections are `<div class="dsec">`, not `<section>`: a `<section>` is a full-height screen in that page.
+
+### The back button goes back, not home
+
+Every page's back button (`back()` in `static/js/settings.js`, used by the artifact page, search, views and settings) calls `goBack()` in `static/js/home.js` and is labelled with the page it goes to (`backLabel`: "Everything", the tag or search, "View", "Back" for another artifact).
+It used to be `home()` everywhere, so tags -> books -> a note -> back landed on the wall, which the pill's home button already does.
+The trail is kept where every navigation already passes, `setRoute` (`navArrive`): the route tokens come through, each with where it was scrolled when the person last pressed something (a view is torn down before its successor sets the route, so the scroll is read at `pointerdown`/`keydown`).
+Arriving on the wall starts the trail over; going back never adds to it (`navReturning`).
+It lives in `sessionStorage` (`enqueue.navTrail`), so a reclaimed webview still knows the way back.
+Browser history is still not used (`replaceState`): the app has no `popstate` handling.
+A vaulted artifact's back still goes to the vault, which keeps it unlocked.
 
 ### Find inside an artifact is ours, not the webview's
 
@@ -1244,6 +1289,18 @@ Adding a feature worth showing means editing `cards()` and its demo, not adding 
 `static/js/md.js` renders a note (desktop editor, phone reader) and `htmlToMd` writes the desktop editor back; a note opened and saved with no edits must come back byte for byte, or it changes shape on its own each time it is touched.
 `tests/js/md_roundtrip.js` (run by `tests/test_md_roundtrip.py`, needs node) pins it: nested and mixed lists, empty bullets (an item, not a list break), dividers (a line of three or more dashes renders as `<hr data-dashes=N>` and is written back with the same count), ordered lists keeping their start, multi-line quotes, code fences, and blocks written with NO blank line between them - md() marks those `data-tight` and the serializer writes them back tight, so lines typed on the phone do not grow blank lines after a desktop save.
 Add a case there for every rendering bug fixed.
+
+### The clipboard is read and written as markdown
+
+`md.js` holds it for every editor (the note editor in `artifact.js`, the capture overlay): `clipToMd(text, html)` turns the clipboard into markdown, `pasteMd(ed, src)` puts it in, `clipOfRange(range)` is what a copy hands over (used by the copy handler in `util.js`).
+Pasting used to type the text in with `insertText`: every line became its own paragraph (a blank line between each on save), only the last "- " line became a bullet, and another app's "•" stayed a literal character.
+Now one plain line is still typed at the caret, and anything with lines or a list is pasted as markdown: the note is serialized with the caret marked (U+E000), the paste is spliced in (`spliceMd`: text at the caret, a list as lines of its own at the depth of the item it lands in), and the whole editor is rendered again from that, so the screen shows exactly what a reload would.
+It goes in through `execCommand("insertHTML")` to stay one undo step, and falls back to setting the HTML when the browser's result does not serialize back to the same markdown.
+`clipTextToMd` maps other apps' bullets ("•", "◦", "1)") to markdown markers, any indent width to two spaces a level, and drops blank lines between items.
+Clipboard HTML is read only when it holds a list (a web page's list has no markers in its plain text); everything else still pastes as text, so styled HTML cannot bring in tags the serializer has no words for.
+Copying used to hand over bare `<li>` elements with no list around them and plain text with no markers: items now get their `<ul>`/`<ol>` back (a numbered one keeps its number), and the plain text is markdown whenever the selection holds a list.
+A page that pastes must define `esc` (md() needs it): the home has it in `util.js`, `capture.html` and `mobile.html` define their own.
+`tests/js/clip.js` pins the text side; the DOM side needs a browser.
 The desktop editor saves as you type (debounced) and on window blur, and `refreshIfStale` never rebuilds an editor holding unsaved words (it re-reads the page only when the store changed elsewhere): rebuilding it on window focus used to drop the words typed since the last blur.
 
 ### The title is prepended for indexing only

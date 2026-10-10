@@ -8,21 +8,60 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 import uuid
+from contextvars import copy_context
 
-from . import chats_worker, db, pivot, privacy
-from .prompts import CHAT_ANSWER, CHAT_TITLE, CHAT_TOPICS
+from . import chats_worker, config, db, pivot, privacy
+from .prompts import CHAT_ANSWER, CHAT_REWRITE, CHAT_TITLE, CHAT_TOPICS
 from .providers.base import get_provider
 from .retrieve.candidates import hit_is_stale
-from .schemas import Answer, ChatTitle, ChatTopics
+from .schemas import Answer, ChatTitle, ChatTopics, Standalone
 
 log = logging.getLogger(__name__)
 
-# Passages an answer may read. Small: a local 8B model given more summarizes instead.
+# Passages an answer may read, and the words kept of each. Small for a model on this
+# machine: a local 8B model given more summarizes instead. A hosted model reads far
+# more, and a chunk is at most about 300 words, so it gets each one whole.
 PASSAGES = 8
+PASSAGE_WORDS = 220
+REMOTE_PASSAGES = 20
+REMOTE_PASSAGE_WORDS = 400
 # Max chunks per artifact in a passage set, so one long note cannot crowd out the rest.
 CHUNKS_PER_ARTIFACT = 2
-PASSAGE_WORDS = 220
+# Turns of the conversation shown to the model that restates a follow-up.
+REWRITE_TURNS = 6
+# A follow-up this short cannot be searched for by itself.
+SHORT_FOLLOW_UP_WORDS = 8
+
+
+def _budget(provider) -> tuple[int, int]:
+    """(passages, words of each) the answering model is given."""
+    if privacy.is_remote(provider):
+        return REMOTE_PASSAGES, REMOTE_PASSAGE_WORDS
+    return PASSAGES, PASSAGE_WORDS
+
+
+def _background(fn):
+    """Start `fn` on a thread now; the returned `wait(seconds)` gives its result, or
+    None when it raised or is not back in time (it then finishes unattended)."""
+    box: dict = {}
+
+    def run() -> None:
+        try:
+            box["value"] = fn()
+        except Exception:  # noqa: BLE001 - preparation is an enhancement, never a gate
+            log.warning("answer preparation failed", exc_info=True)
+
+    worker = threading.Thread(target=copy_context().run, args=(run,), daemon=True)
+    worker.start()
+
+    def wait(seconds: float):
+        worker.join(seconds)
+        return box.get("value")
+
+    return wait
+
 
 # History turns sent with a question; the cap only bounds pathological threads.
 HISTORY_TURNS = 40
@@ -195,22 +234,78 @@ def _clip(text: str, words: int = PASSAGE_WORDS) -> str:
     return text if len(parts) <= words else " ".join(parts[:words]) + " ..."
 
 
-def _scoped_passages(conn, artifact_ids: list[str]) -> list[dict]:
-    """Every chunk of a named set of artifacts. No search: the scope is the answer."""
-    if not artifact_ids:
+def _scoped_passages(conn, artifact_id: str, question: str, limit: int) -> list[dict]:
+    """What an answer about one artifact reads.
+
+    An artifact that fits is read whole, no search. A longer one (a PDF, a long
+    article) used to be cut to its opening chunks, so nothing past the first pages
+    could be answered. Now the answer gets the document in brief (`_overview`), its
+    opening, and the passages that best match the question, in document order.
+    """
+    rows = [
+        dict(r)
+        for r in conn.execute(
+            "SELECT c.id, c.artifact_id, c.text, a.title, a.kind FROM chunks c"
+            " JOIN artifacts a ON a.id = c.artifact_id"
+            " WHERE c.artifact_id = ? ORDER BY c.ordinal",
+            (artifact_id,),
+        )
+    ]
+    if len(rows) <= limit:
+        return rows
+
+    from .index.store import get_store
+
+    overview = _overview(conn, rows[0])
+    room = limit - len(overview)
+    best = get_store().search_within(artifact_id, question, room)
+    if not best:  # nothing indexed yet: the opening is the best there is
+        return overview + rows[:room]
+    chosen = set(([rows[0]["id"]] + [cid for cid in best if cid != rows[0]["id"]])[:room])
+    return overview + [r for r in rows if r["id"] in chosen]
+
+
+def _overview(conn, opening: dict) -> list[dict]:
+    """A long artifact in brief, as one passage: its section summaries when it has
+    them (ingest/source.py), else its summary lines. Empty when it has neither, or
+    they were written from an older body or by another model."""
+    aid = opening["artifact_id"]
+    cache: dict = {}
+
+    def current(rows) -> list:
+        return [r for r in rows if not hit_is_stale(conn, {"artifact_id": aid, **dict(r)}, cache)]
+
+    parts = current(
+        conn.execute(
+            "SELECT summary AS line, model_version, body_version FROM sections"
+            " WHERE artifact_id = ? ORDER BY ordinal",
+            (aid,),
+        ).fetchall()
+    )
+    if parts:
+        head = "The whole document in brief, part by part:"
+        lines = [f"{n}. {r['line']}" for n, r in enumerate(parts, 1)]
+    else:
+        parts = current(
+            conn.execute(
+                "SELECT statement AS line, model_version, body_version, edited FROM facets"
+                " WHERE artifact_id = ? ORDER BY level",
+                (aid,),
+            ).fetchall()
+        )
+        head = "What the whole document says, in brief:"
+        lines = [f"- {r['line']}" for r in parts]
+    if not parts:
         return []
-    marks = ",".join("?" * len(artifact_ids))
-    rows = conn.execute(
-        f"SELECT c.id, c.artifact_id, c.text, a.title, a.kind FROM chunks c"
-        f" JOIN artifacts a ON a.id = c.artifact_id"
-        f" WHERE c.artifact_id IN ({marks}) ORDER BY c.artifact_id, c.ordinal",
-        artifact_ids,
-    ).fetchall()
-    return [dict(r) for r in rows][:PASSAGES]
+    return [
+        opening
+        | {"id": f"overview:{aid}", "text": head + "\n" + "\n".join(lines), "why": "overview"}
+    ]
 
 
 def passages(question: str, scope_kind: str, scope_id: str | None) -> list[dict]:
-    """The passages an answer may read. A scoped chat reads its artifact, no search.
+    """The passages an answer may read. A scoped chat reads its artifact: whole when
+    it fits, searched inside when it does not (`_scoped_passages`).
 
     Everything-scope applies the same relevance floor as /search (Q.5, Q.10). A
     two-sided question ("compare X and Y", retrieve/decompose.py) searches each side
@@ -222,12 +317,14 @@ def passages(question: str, scope_kind: str, scope_id: str | None) -> list[dict]
     if scope_kind == "artifact":
         if scope_id is None:
             return []
+        limit, _ = _budget(get_provider(local_only=privacy.is_local_only(scope_id)))
         conn = db.get_conn()
         try:
-            return _scoped_passages(conn, [scope_id])
+            return _scoped_passages(conn, scope_id, question, limit)
         finally:
             conn.close()
-    return privacy.shareable(_everything_passages(question), get_provider())
+    provider = get_provider()
+    return privacy.shareable(_everything_passages(question, _budget(provider)[0]), provider)
 
 
 def _chat_provider(chat_id: str):
@@ -243,16 +340,17 @@ def _chat_provider(chat_id: str):
     return get_provider(local_only=private and privacy.is_local_only(chat["scope_id"]))
 
 
-def _everything_passages(question: str) -> list[dict]:
+def _everything_passages(question: str, limit: int = PASSAGES) -> list[dict]:
     from .retrieve.decompose import parts
 
     sides = parts(question)
     if not sides:
-        return _library_passages(question)
-    lists = [_library_passages(side) for side in sides] + [_library_passages(question)]
+        return _library_passages(question, limit)
+    lists = [_library_passages(side, limit) for side in sides]
+    lists.append(_library_passages(question, limit))
     out: list[dict] = []
     seen: set[str] = set()
-    for rank in range(PASSAGES):
+    for rank in range(limit):
         for found in lists[:-1]:
             if rank < len(found) and found[rank]["id"] not in seen:
                 out.append(found[rank])
@@ -261,19 +359,32 @@ def _everything_passages(question: str) -> list[dict]:
         if p["id"] not in seen:
             out.append(p)
             seen.add(p["id"])
-    return out[:PASSAGES]
+    return out[:limit]
 
 
-def _library_passages(question: str) -> list[dict]:
+def _library_passages(question: str, limit: int = PASSAGES) -> list[dict]:
     """Everything-scope retrieval for one question, best first."""
+    from .retrieve.lift import lift
+
+    # Query lifting (retrieve/lift.py) is a search-model call: it runs beside the
+    # retrieval below and is waited for only so long (config.CHAT_PREP_WAIT_S).
+    lifting = _background(lambda: lift(question))
     conn = db.get_conn()
     try:
         from .index.store import get_store
-        from .retrieve.candidates import _floor_verdict, judge_gray_zone
+        from .retrieve.candidates import _cached_verdicts, _floor_verdict
+
+        # The gray zone is not sent to a judge here. The answering model reads every
+        # passage it is given and is told to refuse when none fits, so a judge call
+        # before it was the same model ruling twice, on less text, at the cost of one
+        # (often two) more round trips per answer. A verdict /search already cached
+        # is free and still counts: a cached "no" drops the passage.
+        def known(hits: list[dict]) -> set[str]:
+            return _cached_verdicts(question, hits)[0]
 
         store = get_store()
         found: dict[str, dict] = {}
-        window = PASSAGES * 4
+        window = limit * 4
         chunk_legs = store.search_legs(store.CHUNKS, question, limit=window)
         dense_sims: dict[str, float] = {}
         for hit in chunk_legs["dense"][:window]:
@@ -295,7 +406,7 @@ def _library_passages(question: str) -> list[dict]:
             for hit in chunk_legs["fused"]
         }
 
-        # Gray-zone chunks are judged per artifact in one batched call.
+        # Gray-zone chunks are kept unless a cached verdict says otherwise.
         kept_gray: set[str] = set()
         gray_chunks = [cid for cid, verdict in verdicts.items() if verdict == "gray"]
         if gray_chunks:
@@ -315,10 +426,7 @@ def _library_passages(question: str) -> list[dict]:
                         "snippet": " ".join(r["text"].split())[:400],
                     },
                 )
-            kept_gray = judge_gray_zone(
-                question,
-                [{"artifact_id": aid, **info} for aid, info in by_aid.items()],
-            )
+            kept_gray = known([{"artifact_id": aid, **info} for aid, info in by_aid.items()])
 
         # One pass in ranked order, so a judged passage takes the place its rank earned
         # rather than whatever is left after the sure ones.
@@ -332,7 +440,7 @@ def _library_passages(question: str) -> list[dict]:
                 continue
             found[hit["chunk_id"]] = {"score": hit["score"], "why": "passage"}
             per_artifact[aid] = per_artifact.get(aid, 0) + 1
-            if len(found) >= PASSAGES:
+            if len(found) >= limit:
                 break
 
         # Facet/entity hits face the same floor: keyword leg = lexical, dense leg = similarity.
@@ -344,9 +452,8 @@ def _library_passages(question: str) -> list[dict]:
         }
         # Query lifting (retrieve/lift.py): facet-style restatements of the question
         # search the facet index too. Their dense similarity counts; never lexical.
-        from .retrieve.lift import lift
-
-        lift_legs = [store.search_legs(store.FACETS, claim, limit=4) for claim in lift(question)]
+        claims = lifting(config.CHAT_PREP_WAIT_S) or []
+        lift_legs = [store.search_legs(store.FACETS, claim, limit=4) for claim in claims]
         facet_hits = fe_legs[store.FACETS]["fused"] + [h for ll in lift_legs for h in ll["fused"]]
         for ll in lift_legs:
             for hit in ll["dense"][:window]:
@@ -455,7 +562,6 @@ def _library_passages(question: str) -> list[dict]:
                 continue
             _pull_section(aid, hit.get("ordinal") or 1, why, hit["score"])
 
-        # The judge reads the matched facet statement / entity fact, not the opening chunk.
         if gray_facet_entity:
             faces = {
                 r["id"]: (r["title"], r["kind"])
@@ -465,8 +571,7 @@ def _library_passages(question: str) -> list[dict]:
                     (json.dumps(list(gray_facet_entity)),),
                 ).fetchall()
             }
-            kept = judge_gray_zone(
-                question,
+            kept = known(
                 [
                     {
                         "artifact_id": aid,
@@ -475,7 +580,7 @@ def _library_passages(question: str) -> list[dict]:
                         "snippet": " ".join(snippet.split())[:400],
                     }
                     for aid, (_why, _score, snippet) in gray_facet_entity.items()
-                ],
+                ]
             )
             for aid, (why, score, _snippet) in gray_facet_entity.items():
                 if aid not in kept:
@@ -497,7 +602,7 @@ def _library_passages(question: str) -> list[dict]:
 
         out = [dict(r) | found[r["id"]] for r in rows]
         out.sort(key=lambda r: r["score"], reverse=True)
-        return out[:PASSAGES]
+        return out[:limit]
     finally:
         conn.close()
 
@@ -588,11 +693,14 @@ def _ask_model(
 
     # The header MUST carry the artifact id: the Answer validator rejects cited ids it
     # was not offered (CHATBUG.1).
+    provider = provider or get_provider()
+    _, words = _budget(provider)
     body = "\n\n".join(
-        f"[{p.get('kind', 'artifact')}] (id: {p['artifact_id']}) {p['title']}\n{_clip(p['text'])}"
+        f"[{p.get('kind', 'artifact')}] (id: {p['artifact_id']}) {p['title']}\n"
+        f"{_clip(p['text'], words)}"
         for p in found
     )
-    return (provider or get_provider()).complete(
+    return provider.complete(
         system=CHAT_ANSWER,
         user=f"{history}Question: {question}\n\nPassages:\n\n{body}",
         response_model=Answer,
@@ -669,7 +777,10 @@ def run_answer(chat_id: str, text: str) -> dict:
     finally:
         conn.close()
 
-    found = passages(text, chat["scope_kind"], chat["scope_id"])
+    # Retrieval runs on the question as it stands alone; the model still answers the
+    # message as typed, with the conversation above it.
+    asked = _standalone(chat, text)
+    found = passages(asked, chat["scope_kind"], chat["scope_id"])
     empty_reason = empty_scope_reason(chat["scope_kind"], chat["scope_id"]) if not found else None
     answer = _ask_model(text, history, found, empty_reason, provider=_chat_provider(chat_id))
 
@@ -682,6 +793,60 @@ def run_answer(chat_id: str, text: str) -> dict:
         "payload": None,
         "cited": [aid for aid in dict.fromkeys(answer.cited) if aid in by_artifact],
     }
+
+
+def _standalone(chat, text: str) -> str:
+    """The question to search for: `text`, or for a follow-up the same question
+    restated so it stands without the conversation.
+
+    "What about the second one?" used to be searched for as those words; the
+    conversation reached the answering model but never the search. On a follow-up the
+    search model restates the message from the last few turns, in the one call that
+    also lifts it into claims (cached for retrieve/lift.py), so a follow-up costs no
+    more model calls than a first question. If the model is not back in
+    config.CHAT_PREP_WAIT_S, a short follow-up is searched together with the question
+    before it, and a long one as typed.
+    """
+    conn = db.get_conn()
+    try:
+        prior = conn.execute(
+            "SELECT role, text FROM chat_messages WHERE chat_id = ? AND status = 'done'"
+            " ORDER BY ordinal DESC LIMIT ?",
+            (chat["id"], REWRITE_TURNS + 1),
+        ).fetchall()[
+            1:
+        ]  # the newest done row is this message
+    finally:
+        conn.close()
+    prior = [r for r in reversed(prior) if r["text"].strip()]
+    asked_before = [r["text"] for r in prior if r["role"] == "user"]
+    if not asked_before:
+        return text
+
+    private = chat["scope_kind"] == "artifact" and privacy.is_local_only(chat["scope_id"])
+    transcript = "\n".join(f"{r['role']}: {' '.join(r['text'].split())[:400]}" for r in prior)
+
+    def restate() -> str:
+        from .retrieve import lift
+
+        provider = get_provider(local_only=True) if private else get_provider(role="search")
+        out = provider.complete(
+            system=CHAT_REWRITE,
+            user=f"Conversation:\n{transcript}\n\nLatest message: {text}",
+            response_model=Standalone,
+        )
+        question = " ".join(out.question.split())
+        claims = lift._clean(out.claims)
+        if claims:
+            lift.store(question, provider.model, claims)
+        return question
+
+    restated = _background(restate)(config.CHAT_PREP_WAIT_S)
+    if restated:
+        return restated
+    if len(text.split()) < SHORT_FOLLOW_UP_WORDS:
+        return f"{asked_before[-1]} {text}"
+    return text
 
 
 def run_organize(chat_id: str, text: str) -> dict:

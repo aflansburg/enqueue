@@ -90,27 +90,17 @@ class TestKeywordLeg:
 
 
 class TestChatFloor:
-    def test_filler_words_do_not_carry_a_passage_past_the_floor(
-        self, sqlite_store, quiet_queue, monkeypatch
-    ):
+    def test_filler_words_do_not_carry_a_passage_past_the_floor(self, sqlite_store, quiet_queue):
         """ "what ... the ... about" sits inside a1 as substrings. That is not a match:
-        with the judge ruling nothing relevant, the answer must be fed nothing."""
-        from enqueue.retrieve import candidates as cand
-
+        a question about nothing in the library must feed the answer nothing."""
         _library(sqlite_store)
-        monkeypatch.setattr(cand, "judge_gray_zone", lambda question, hits: set())
 
         found = chats.passages("what is the quantum flux capacitor about", "library", None)
 
         assert found == [], f"filler words must not ground an answer, got {found}"
 
-    def test_judged_passages_are_fed_in_ranked_order(self, sqlite_store, quiet_queue, monkeypatch):
-        from enqueue.retrieve import candidates as cand
-
+    def test_passages_are_fed_in_ranked_order(self, sqlite_store, quiet_queue):
         _library(sqlite_store)
-        monkeypatch.setattr(
-            cand, "judge_gray_zone", lambda question, hits: {h["artifact_id"] for h in hits}
-        )
 
         found = chats.passages("growing food in the city", "library", None)
 

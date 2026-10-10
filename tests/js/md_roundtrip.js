@@ -116,6 +116,14 @@ const exact = {
 const normalised = {
   "a tab-indented bullet keeps its nesting": ["- a\n\t- b", "- a\n  - b"],
   "star and plus bullets": ["* a\n+ b", "- a\n- b"],
+  // A blank line between a bullet and its indented child (how other tools write a
+  // list) must keep the child nested: it used to come back at the root.
+  "a blank line before a nested item keeps the nesting": [
+    "- a\n\n  - b\n  - b2\n- c\n\n  - d",
+    "- a\n  - b\n  - b2\n- c\n  - d",
+  ],
+  "a blank line between items is one list": ["- a\n\n- b", "- a\n- b"],
+  "a blank line before a nested number keeps it": ["- a\n\n  1. b\n  2. c", "- a\n  1. b\n  2. c"],
 };
 
 let failed = 0;

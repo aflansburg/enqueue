@@ -1493,10 +1493,12 @@ async function rebuildIndex(button) {
 	}
 }
 
-// The one way back to the wall, on every page that has one: the same chevron and
-// word as an open artifact (search, views and settings used a lowercase arrow link).
+// The one way back, on every page that has one: the same chevron as an open
+// artifact, the name of the page it goes to (home.js goBack / backLabel).
 function back() {
-	return '<button class="btn ghost back" onclick="home()">' + svg("back") + "Everything</button>";
+	return (
+		'<button class="btn ghost back" onclick="goBack()">' + svg("back") + esc(backLabel()) + "</button>"
+	);
 }
 
 // Boot restores whatever was open when the page was reclaimed (K.9): the hash

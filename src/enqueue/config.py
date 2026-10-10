@@ -206,3 +206,8 @@ SEARCH_RERANK = _SEARCH_RERANK in ("1", "true", "yes", "on")
 # How long /search waits for the gray-zone judge before answering without it. The
 # judge keeps running and caches its verdicts, so the same search is exact next time.
 SEARCH_JUDGE_WAIT_S = float(os.getenv("ENQ_SEARCH_JUDGE_WAIT", "2.5"))
+
+# How long an answer waits for the search model to prepare its retrieval (restating a
+# follow-up as a question that stands alone, lifting a question into claims) before
+# retrieving without it. The call finishes in the background and caches what it can.
+CHAT_PREP_WAIT_S = float(os.getenv("ENQ_CHAT_PREP_WAIT", "8"))

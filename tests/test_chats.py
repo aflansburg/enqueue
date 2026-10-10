@@ -494,46 +494,30 @@ class TestQ5AnswerPathFloor:
         # below DROP_BELOW, so no passage survives the two-tier gate.
         assert found == [], f"gibberish question must yield no passages, got {found}"
 
-    def test_a_gray_zone_question_is_kept_only_if_the_judge_says_relevant(
+    def test_a_gray_zone_passage_is_read_unless_search_already_ruled_it_out(
         self, store, quiet_queue, monkeypatch
     ):
-        """The gray zone (at or above DROP_BELOW, below KEEP_ABOVE) is the
-        judge's patch (Q.3b), and the answer path runs the same judge as
-        /search. "food supply chains" measures in the gray zone
-        against this corpus, so `passages()` sends it to the judge in one
-        batched call: a "not relevant" ruling feeds the answer nothing, a
-        "relevant" ruling lets the passage through."""
+        """The gray zone (at or above DROP_BELOW, below KEEP_ABOVE) reaches the
+        answering model, which rules on it itself; no judge is called for an answer.
+        "food supply chains" measures in the gray zone against this corpus. A verdict
+        /search has already cached still counts: a cached "no" drops the passage."""
         from enqueue.retrieve import candidates as cand
 
         self._library(store, monkeypatch)
 
-        class _Judge:
+        class _NoCalls:
             model = "test-model"
 
-            def __init__(self, verdicts):
-                self.verdicts = verdicts
+            def complete(self, *a, **k):
+                raise AssertionError("an answer's retrieval must not call the judge")
 
-            def complete(self, system, user, response_model, context=None, max_retries=3):
-                return response_model(verdicts=self.verdicts)
+        monkeypatch.setattr(cand, "get_provider", lambda *a, **k: _NoCalls())
 
-        monkeypatch.setattr(
-            cand, "get_provider", lambda *a, **k: _Judge([{"id": "a1", "relevant": False}])
-        )
         found = chats.passages("food supply chains", "library", None)
-        assert found == [], f"judge said not relevant, expected no passages, got {found}"
-        # Clear the judge's cache and rule it relevant.
-        conn = db.get_conn()
-        try:
-            conn.execute("DELETE FROM derived_values WHERE scope = 'gray_judge'")
-            conn.commit()
-        finally:
-            conn.close()
-        monkeypatch.setattr(
-            cand, "get_provider", lambda *a, **k: _Judge([{"id": "a1", "relevant": True}])
-        )
-        found = chats.passages("food supply chains", "library", None)
-        assert len(found) == 1
-        assert found[0]["artifact_id"] == "a1"
+        assert [p["artifact_id"] for p in found] == ["a1"]
+
+        cand._judge_cache_write("food supply chains", "a1", False, "test-model")
+        assert chats.passages("food supply chains", "library", None) == []
 
     def test_a_real_question_still_finds_its_passages(self, store, quiet_queue, monkeypatch):
         self._library(store, monkeypatch)

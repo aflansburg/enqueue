@@ -84,7 +84,7 @@ def test_chat_passages_leave_out_local_only_notes_for_a_remote_model(
         {"id": "p1", "artifact_id": private, "title": "Kiln accident", "text": "hospital"},
         {"id": "p2", "artifact_id": public, "title": "Kiln firing", "text": "schedule"},
     ]
-    monkeypatch.setattr(chats, "_everything_passages", lambda q: list(found))
+    monkeypatch.setattr(chats, "_everything_passages", lambda q, limit: list(found))
 
     monkeypatch.setattr(chats, "get_provider", lambda **kw: _Remote())
     assert [p["artifact_id"] for p in chats.passages("kiln", "everything", None)] == [public]

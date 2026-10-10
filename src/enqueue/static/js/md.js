@@ -159,7 +159,20 @@
       root.lists.forEach((list, i) => out.push(renderList(list, i === 0)));
       items.length = 0;
     };
-    for (const raw of t.split("\n")) {
+    const rawLines = t.split("\n");
+    const LIST_ITEM = /^\s*(?:[-*+]|\d+\.)(?:\s|$)/;
+    // Whether the next line with anything on it is a list item. A blank line between
+    // two items does not end the list: notes brought in from other tools write
+    // "- parent", a blank line, "  - child". Ending the list there left the child with
+    // no parent, so it rendered at the root, and the next save wrote it back flat -
+    // the note lost its nesting for good just by being opened.
+    const listGoesOn = (from) => {
+      for (let j = from + 1; j < rawLines.length; j++)
+        if (rawLines[j].trim()) return LIST_ITEM.test(rawLines[j]);
+      return false;
+    };
+    for (let at = 0; at < rawLines.length; at++) {
+      const raw = rawLines[at];
       // A leading tab is one level, the same as two spaces (what the serializer and
       // the phone's indent tool write), so a tab-indented item keeps its nesting.
       const line = raw.trimEnd().replace(/^[ \t]+/, (lead) => lead.replace(/\t/g, "  "));
@@ -200,8 +213,9 @@
         flushList();
         const fence = held[+line.trim().slice(1, -1)];
         out.push(fence.replace("<pre>", "<pre" + tight() + ">"));
-      } else if (!line.trim()) flushList();
-      else {
+      } else if (!line.trim()) {
+        if (!(items.length && listGoesOn(at))) flushList();
+      } else {
         flushList();
         out.push("<p" + tight() + ">" + line + "</p>");
       }
@@ -407,6 +421,226 @@
       .join("\n")
       .replace(/\n{3,}/g, "\n\n")
       .replace(/^\n+|\n+$/g, "");
+  }
+
+  // ---- The clipboard: lists in, lists out ---------------------------------------
+  //
+  // A note is markdown, so the clipboard is read and written as markdown too. Pasting
+  // used to type the text in line by line: every line became its own paragraph (a
+  // blank line between each on save), only the last "- " line turned into a bullet,
+  // and a "•" from another app stayed a literal character. Copying handed over bare
+  // <li> elements with no list around them and plain text with no markers at all.
+
+  // Where the caret is, and where it goes after a paste. Private-use characters: they
+  // pass through md() and htmlToMd() as ordinary text and cannot be in a note.
+  const CARET = "";
+  const CARET_AFTER = "";
+  const LIST_LINE = /^(\s*)([-*+]|\d+\.)(\s+|$)/;
+
+  // Plain text from the clipboard as markdown: the bullets other apps write ("•",
+  // "◦", "1)") become markdown markers, their indentation becomes two spaces a level
+  // whatever width it had, and a blank line between two items is dropped so the list
+  // arrives as one list.
+  function clipTextToMd(text) {
+    const lines = text.replace(/\r\n?/g, "\n").replace(/ /g, " ").split("\n");
+    const parsed = lines.map((line) => {
+      const m = line.match(/^([ \t]*)([•◦▪▫‣⁃·●○■□*+-]|\d+[.)])[ \t]+(.*)$/);
+      if (!m) return { line };
+      const width = m[1].replace(/\t/g, "    ").length;
+      const marker = /\d/.test(m[2]) ? m[2].replace(")", ".") : "-";
+      return { width, marker, rest: m[3].trimEnd() };
+    });
+    const widths = [...new Set(parsed.filter((p) => p.marker).map((p) => p.width))].sort(
+      (a, b) => a - b,
+    );
+    const out = [];
+    parsed.forEach((p, i) => {
+      if (p.marker) {
+        out.push("  ".repeat(widths.indexOf(p.width)) + p.marker + " " + p.rest);
+        return;
+      }
+      const blank = !p.line.trim();
+      const said = (q) => q.marker || q.line.trim();
+      const before = parsed.slice(0, i).reverse().find(said);
+      const after = parsed.slice(i + 1).find(said);
+      if (blank && before && before.marker && after && after.marker) return;
+      out.push(p.line.trimEnd());
+    });
+    return out.join("\n").replace(/^\n+|\n+$/g, "");
+  }
+
+  // Rich text from the clipboard as markdown, or null when it holds no list. Only a
+  // list is worth reading from HTML: its plain-text twin often has no markers at all
+  // (a web page's list copies as bare lines). Everything else still pastes as text,
+  // so styled HTML cannot smuggle in tags the serializer has no words for. Wrappers
+  // (a Google Docs <b>, nested <div>s) are opened up until the blocks htmlToMd()
+  // knows are at the top.
+  function clipHtmlToMd(html) {
+    if (!html || !/<li[\s>]/i.test(html) || typeof DOMParser === "undefined") return null;
+    const doc = new DOMParser().parseFromString(html, "text/html");
+    const root = doc.createElement("div");
+    const BLOCK = new Set(["UL", "OL", "H1", "H2", "H3", "PRE", "BLOCKQUOTE", "HR"]);
+    const SKIP = new Set(["META", "STYLE", "SCRIPT", "TITLE", "LINK", "HEAD"]);
+    const holdsBlocks = (el) =>
+      !!el.querySelector("ul,ol,p,div,h1,h2,h3,h4,h5,h6,pre,blockquote,hr,table");
+    let run = null;
+    const lift = (node) => {
+      for (const child of [...node.childNodes]) {
+        if (child.nodeType === 1 && SKIP.has(child.tagName)) continue;
+        if (child.nodeType === 1 && BLOCK.has(child.tagName)) {
+          run = null;
+          root.appendChild(child);
+        } else if (child.nodeType === 1 && holdsBlocks(child)) {
+          run = null;
+          lift(child);
+          run = null;
+        } else if (child.nodeType === 1 && /^(P|DIV|H[4-6]|TR)$/.test(child.tagName)) {
+          run = null;
+          const p = doc.createElement("p");
+          p.append(...child.childNodes);
+          if (p.textContent.trim()) root.appendChild(p);
+        } else if (child.nodeType === 1 || (child.nodeType === 3 && child.nodeValue.trim())) {
+          if (!run) root.appendChild((run = doc.createElement("p")));
+          run.appendChild(child);
+        }
+      }
+    };
+    lift(doc.body);
+    return htmlToMd(root) || null;
+  }
+
+  // What a paste means: the markdown to put in, and whether it has to go in as
+  // blocks (`pasteMd`) or can simply be typed at the caret (one plain line).
+  function clipToMd(text, html) {
+    const fromHtml = clipHtmlToMd(html);
+    const src = fromHtml !== null ? fromHtml : clipTextToMd(text || "");
+    return { src, blocks: fromHtml !== null || src.includes("\n") || LIST_LINE.test(src) };
+  }
+
+  // `pasted` markdown put into `src` where the CARET character sits, with CARET_AFTER
+  // left at its end. Text goes in where the caret is. A list goes in as lines of its
+  // own: under the paragraph the caret is in, or among the items of the list it is
+  // in, at that item's depth; an empty line or an empty item is replaced by it.
+  function spliceMd(src, pasted) {
+    const lines = src.split("\n");
+    const at = lines.findIndex((l) => l.includes(CARET));
+    if (at < 0) {
+      // The caret was somewhere markdown has no place for (between two items): the
+      // paste goes at the end, as more of the list when both are lists.
+      const joins = LIST_LINE.test(lines[lines.length - 1]) && LIST_LINE.test(pasted);
+      return src + (src ? (joins ? "\n" : "\n\n") : "") + pasted + CARET_AFTER;
+    }
+    const [before, after] = lines[at].split(CARET);
+    const body = pasted.split("\n");
+    body[body.length - 1] += CARET_AFTER;
+    if (!LIST_LINE.test(body[0])) {
+      body[0] = before + body[0];
+      body[body.length - 1] += after;
+      lines.splice(at, 1, ...body);
+      return lines.join("\n");
+    }
+    const item = before.match(LIST_LINE);
+    const pad = item ? item[1] : "";
+    const head = item ? before.slice(item[0].length) : before;
+    const put = [];
+    if (head.trim()) put.push(before.trimEnd());
+    put.push(...body.map((l) => pad + l));
+    if (after.trim()) put.push(item ? item[0] + after.trimStart() : after.trimStart());
+    lines.splice(at, 1, ...put);
+    return lines.join("\n");
+  }
+
+  // Paste markdown into an editor at the caret. The note is written out as markdown
+  // with the caret marked, the paste is spliced into that (`spliceMd`), and the whole
+  // editor is rendered again, so what is on screen is exactly what a reload would
+  // show. Returns false when the caret is not in the editor (the caller falls back).
+  function pasteMd(ed, pasted) {
+    const sel = window.getSelection();
+    if (!sel.rangeCount) return false;
+    const range = sel.getRangeAt(0);
+    if (!ed.contains(range.commonAncestorContainer)) return false;
+    range.deleteContents();
+    const mark = document.createTextNode(CARET);
+    range.insertNode(mark);
+    let src, html;
+    try {
+      src = spliceMd(htmlToMd(ed), pasted);
+      html = md(src);
+    } catch (_) {
+      // Nothing has been replaced yet: take the mark back out and let the caller
+      // paste the plain way, rather than leave a stray character in the note.
+      mark.remove();
+      return false;
+    }
+    // As one undoable edit when the browser does it faithfully, else directly.
+    const all = document.createRange();
+    all.selectNodeContents(ed);
+    sel.removeAllRanges();
+    sel.addRange(all);
+    let done = false;
+    try {
+      done = document.execCommand("insertHTML", false, html) && htmlToMd(ed) === src;
+    } catch (_) {
+      done = false;
+    }
+    if (!done) ed.innerHTML = html;
+    for (const a of ed.querySelectorAll("a[href]"))
+      if (a.getAttribute("href").includes(CARET_AFTER))
+        a.setAttribute("href", a.getAttribute("href").replace(CARET_AFTER, ""));
+    const walker = document.createTreeWalker(ed, NodeFilter.SHOW_TEXT);
+    let caret = null;
+    for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+      const i = n.nodeValue.indexOf(CARET_AFTER);
+      if (i < 0) continue;
+      n.nodeValue = n.nodeValue.replace(CARET_AFTER, "");
+      caret = caret || [n, i];
+    }
+    if (caret) {
+      const r = document.createRange();
+      r.setStart(caret[0], caret[1]);
+      r.collapse(true);
+      sel.removeAllRanges();
+      sel.addRange(r);
+      const el = caret[0].parentElement;
+      if (el && el.scrollIntoView) el.scrollIntoView({ block: "nearest" });
+    }
+    if (!done) ed.dispatchEvent(new Event("input", { bubbles: true }));
+    return true;
+  }
+
+  // What a selection puts on the clipboard: { html, text }. Items selected out of a
+  // list are given their list back (and a numbered one its number), so they paste as
+  // a list anywhere. `text` is markdown when the selection holds a list - markers,
+  // nesting and numbers - and null when the browser's own plain text is right.
+  function clipOfRange(range) {
+    const wrap = document.createElement("div");
+    wrap.appendChild(range.cloneContents());
+    const host =
+      range.commonAncestorContainer.nodeType === 1
+        ? range.commonAncestorContainer
+        : range.commonAncestorContainer.parentElement;
+    // The number the first copied item of a numbered list carries in the note.
+    const numberIn = (ol) => {
+      let first = range.startContainer;
+      while (first && first.parentNode !== ol) first = first.parentNode;
+      const at = [...ol.children].filter((c) => c.tagName === "LI").indexOf(first);
+      return (parseInt(ol.getAttribute("start") || "1", 10) || 1) + Math.max(at, 0);
+    };
+    const number = (ol, n) => (n > 1 ? ol.setAttribute("start", String(n)) : null);
+    if ([...wrap.children].some((c) => c.tagName === "LI")) {
+      const from = host && host.closest ? host.closest("ul,ol") : null;
+      const list = document.createElement(from ? from.tagName : "UL");
+      if (from && from.tagName === "OL") number(list, numberIn(from));
+      list.append(...wrap.childNodes);
+      wrap.appendChild(list);
+    } else {
+      // A selection that starts partway down a numbered list and runs on past it.
+      const start = range.startContainer.nodeType === 1 ? range.startContainer : range.startContainer.parentElement;
+      const from = start && start.closest ? start.closest("ol") : null;
+      const copied = wrap.querySelector("ol");
+      if (from && copied && host.contains(from) && host !== from) number(copied, numberIn(from));
+    }
+    return { html: wrap.innerHTML, text: wrap.querySelector("li") ? htmlToMd(wrap) : null };
   }
 
   // A note's title is its first markdown heading, else the first non-empty line,

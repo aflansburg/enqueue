@@ -640,6 +640,10 @@ def hit_is_stale(conn, hit: dict, cache: dict) -> bool:
     current = cache[aid]
     if current is None:
         return True
+    if hit.get("edited"):
+        # A line the person wrote or rewrote is theirs: no model wrote it, and
+        # regeneration keeps it, so neither a model switch nor an edit stales it.
+        return False
     body_version, model = current
     return hit.get("body_version") != body_version or hit.get("model_version") != model
 

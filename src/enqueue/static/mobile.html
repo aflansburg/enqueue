@@ -3174,7 +3174,33 @@
   // handles camera lifecycle internally when scan() is invoked.
   function startCamera() {}
 
+  // Where the reader was opened from, when that was not the library: a shelf's own
+  // page (a tag, a view's header) or a conversation. Back from the reader returns
+  // there, scrolled to where it was. It used to go to the library every time, so
+  // books -> a note -> back lost the list you were reading down.
+  let readerFrom = null;
+  const SCREENS = [
+    "setup",
+    "library",
+    "reader",
+    "crop",
+    "link_capture",
+    "chat",
+    "settings",
+    "shelf_page",
+    "vault",
+  ];
+
   function show(id) {
+    if (id === "reader") {
+      const from = SCREENS.find((s) => {
+        const el = document.getElementById(s);
+        return el && !el.hidden;
+      });
+      if (from !== "reader")
+        readerFrom =
+          from === "shelf_page" || from === "chat" ? { screen: from, y: window.scrollY } : null;
+    }
     // Any view switch closes the details side panel so it never lingers over a
     // different screen (this also makes the Android back gesture dismiss it).
     const dp = document.getElementById("details_panel");
@@ -3185,17 +3211,7 @@
     // others and never un-hides the target - a blank screen. "crop" and
     // "link_capture" were missing, which is why taking/uploading a photo (which ends
     // in show("crop")) and the link form silently showed nothing.
-    for (const s of [
-      "setup",
-      "library",
-      "reader",
-      "crop",
-      "link_capture",
-      "chat",
-      "settings",
-      "shelf_page",
-      "vault",
-    ]) {
+    for (const s of SCREENS) {
       const el = document.getElementById(s);
       if (el) el.hidden = s !== id;
     }
@@ -5165,14 +5181,25 @@
     .getElementById("to_library")
     // Re-render the library on the way back so a pin / edit made in the reader is
     // reflected (the Saved shelf, ordering) instead of showing the stale cached list.
-    .addEventListener("click", () => {
-      if (readerVaulted) {
-        openMobileVault(); // back to the vault, still unlocked
-        return;
-      }
+    .addEventListener("click", leaveReader);
+  // Back out of the reader: to the vault for a vaulted item (still unlocked), to the
+  // shelf page or conversation it was opened from, else to the library. The library
+  // is re-rendered either way, so a pin or an edit made in the reader shows.
+  function leaveReader() {
+    if (readerVaulted) {
+      openMobileVault();
+      return;
+    }
+    const from = readerFrom;
+    readerFrom = null;
+    renderLibrary();
+    if (!from) {
       show("library");
-      renderLibrary();
-    });
+      return;
+    }
+    show(from.screen);
+    requestAnimationFrame(() => window.scrollTo(0, from.y || 0));
+  }
   // The Android Back gesture. The shell asks the page first (MainActivity's back
   // callback calls this) and only leaves the app when the page says it had nothing to
   // close. Web history is not trusted for this: Chromium skips history entries a page
@@ -5204,8 +5231,8 @@
       if (db) db.classList.remove("open");
       return true;
     }
-    if (!document.getElementById("reader").hidden && readerVaulted) {
-      openMobileVault(); // back to the vault, still unlocked
+    if (!document.getElementById("reader").hidden) {
+      leaveReader();
       return true;
     }
     if (!document.getElementById("library").hidden) return false;
@@ -5224,6 +5251,10 @@
       return;
     }
     if (!document.getElementById("library").hidden) return;
+    if (!document.getElementById("reader").hidden) {
+      leaveReader();
+      return;
+    }
     show("library");
     renderLibrary();
   });

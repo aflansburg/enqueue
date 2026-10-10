@@ -516,14 +516,13 @@
     let html =
       '<div class="pagecol">' +
       // A vaulted artifact is read "inside" the vault, so its back returns there
-      // (which keeps the vault unlocked); a normal artifact goes back to the wall.
+      // (which keeps the vault unlocked); a normal artifact goes back to the page it
+      // was opened from (home.js goBack).
       (a.vaulted_at
         ? '<button class="btn ghost back" onclick="openVault()">' +
           svg("back") +
           "Vault</button>"
-        : '<button class="btn ghost back" onclick="home()">' +
-          svg("back") +
-          "Everything</button>") +
+        : back()) +
       '<div class="kindrow"><span class="kindmark"></span>' +
       '<span class="kindword">' +
       esc(a.kind) +
@@ -1765,9 +1764,11 @@
       }
     });
     // Paste. An image on the clipboard is embedded into the note (uploaded as a
-    // hidden image artifact, referenced as `![](/artifacts/{id}/blob)`); everything
-    // else pastes as plain text. Pasting styled HTML from a browser would smuggle in
-    // tags the serialiser cannot represent, and they would be silently lost on save.
+    // hidden image artifact, referenced as `![](/artifacts/{id}/blob)`). One plain
+    // line is typed in at the caret. Anything with lines or a list is pasted as
+    // markdown (md.js clipToMd / pasteMd), so a list arrives as one list instead of a
+    // paragraph per line. Styled HTML is only read for its lists: anything else would
+    // smuggle in tags the serialiser cannot represent, silently lost on save.
     ed.addEventListener("paste", (e) => {
       const cd = e.clipboardData || window.clipboardData;
       const images = [...((cd && cd.items) || [])].filter(
@@ -1782,7 +1783,12 @@
         return;
       }
       e.preventDefault();
-      document.execCommand("insertText", false, (cd && cd.getData("text")) || "");
+      const text = (cd && cd.getData("text")) || "";
+      const clip = clipToMd(text, (cd && cd.getData("text/html")) || "");
+      const at = window.getSelection().anchorNode;
+      const inCode = at && (at.nodeType === 1 ? at : at.parentElement).closest("pre");
+      if (inCode || !clip.blocks || !pasteMd(ed, clip.src))
+        document.execCommand("insertText", false, inCode ? text : clip.src);
     });
 
     if (focus) {

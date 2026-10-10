@@ -47,7 +47,7 @@ def test_sides_are_interleaved_then_topped_up_from_the_whole(monkeypatch):
         "scrum": [_p("s1")],
         "kanban vs scrum": [_p("k1"), _p("w1")],
     }
-    monkeypatch.setattr(chats, "_library_passages", lambda q: results[q])
+    monkeypatch.setattr(chats, "_library_passages", lambda q, limit: results[q])
 
     found = chats.passages("kanban vs scrum", "library", None)
 
@@ -56,7 +56,7 @@ def test_sides_are_interleaved_then_topped_up_from_the_whole(monkeypatch):
 
 def test_a_plain_question_searches_once(monkeypatch):
     asked = []
-    monkeypatch.setattr(chats, "_library_passages", lambda q: asked.append(q) or [])
+    monkeypatch.setattr(chats, "_library_passages", lambda q, limit: asked.append(q) or [])
 
     chats.passages("what did I save about kilns", "library", None)
 

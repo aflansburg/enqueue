@@ -467,6 +467,36 @@ class SqliteVecStore(VectorStore):
             )
         return len(entries)
 
+    def chunks_indexed(self, artifact_id: str) -> bool:
+        """Whether every chunk of the artifact is in the index exactly as it would be
+        written now: a vector and a substring row each, and the keyword row holding
+        today's title, context and text. False for an artifact with no chunks."""
+        self.ensure()
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT c.id, c.text, c.context, a.title"
+                " FROM chunks c JOIN artifacts a ON a.id = c.artifact_id"
+                " WHERE c.artifact_id = ?",
+                (artifact_id,),
+            ).fetchall()
+            if not rows:
+                return False
+            mine = "(SELECT id FROM chunks WHERE artifact_id = ?)"
+            for table in ("vec_chunks", "fts_chunks_tri"):
+                found = conn.execute(
+                    f"SELECT COUNT(*) FROM {table} WHERE chunk_id IN {mine}", (artifact_id,)
+                ).fetchone()[0]
+                if found != len(rows):
+                    return False
+            indexed = [
+                (r["chunk_id"], r["title"], r["text"])
+                for r in conn.execute(
+                    f"SELECT chunk_id, title, text FROM fts_chunks WHERE chunk_id IN {mine}",
+                    (artifact_id,),
+                )
+            ]
+        return sorted(indexed) == sorted((r["id"], *_chunk_entries(r)[1]) for r in rows)
+
     def index_facets_artifact(self, artifact_id: str) -> int:
         """Re-embed one artifact's facets in place. The caller generates them first."""
         return self._index_layer_artifact(self.FACETS, artifact_id)
@@ -636,6 +666,39 @@ class SqliteVecStore(VectorStore):
             if r["chunk_id"] != chunk_id
         ][:limit]
 
+    def search_within(self, artifact_id: str, text: str, limit: int = 20) -> list[str]:
+        """Chunk ids of one artifact, best match for `text` first: its stored vectors
+        against the query, and the keyword leg kept to its chunks, fused with RRF.
+        For a question asked of one long document (chats._scoped_passages)."""
+        own = "SELECT id FROM chunks WHERE artifact_id = ?"
+        conn = self._connect()
+        try:
+            dense = [
+                row[0]
+                for row in conn.execute(
+                    f"SELECT chunk_id FROM vec_chunks WHERE chunk_id IN ({own})"
+                    " ORDER BY vec_distance_L2(embedding, ?) LIMIT ?",
+                    (artifact_id, json.dumps(embed_query(text)), limit),
+                )
+            ]
+            keyword: list[str] = []
+            query = _fts_query(text)
+            if query:
+                keyword = [
+                    row[0]
+                    for row in conn.execute(
+                        "SELECT chunk_id FROM fts_chunks WHERE fts_chunks MATCH ?"
+                        f" AND chunk_id IN ({own})"
+                        " ORDER BY bm25(fts_chunks, 1.0, 10.0, 1.0) LIMIT ?",
+                        (query, artifact_id, limit),
+                    )
+                ]
+        except OperationalError:
+            return []
+        finally:
+            conn.close()
+        return [item for item, _ in rrf_scored(dense, keyword, k=60, limit=limit)]
+
     def search_dense(
         self, name: str, text: str, limit: int = 30, as_query: bool = True
     ) -> list[dict]:
@@ -803,7 +866,7 @@ class SqliteVecStore(VectorStore):
             ).fetchall()
         else:
             rows = conn.execute(
-                "SELECT id, artifact_id, level, trust, model_version, body_version"
+                "SELECT id, artifact_id, level, trust, model_version, body_version, edited"
                 " FROM facets"
                 " WHERE id IN (SELECT value FROM json_each(?))",
                 (ids,),
@@ -836,6 +899,7 @@ class SqliteVecStore(VectorStore):
                 hit["trust"] = row["trust"]
                 hit["model_version"] = row["model_version"]
                 hit["body_version"] = row["body_version"]
+                hit["edited"] = bool(row["edited"])
             out.append(hit)
         return out
 

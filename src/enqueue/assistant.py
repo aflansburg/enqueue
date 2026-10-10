@@ -16,6 +16,7 @@ wrong to fall back to.
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -72,15 +73,25 @@ REGISTRY: dict[str, Skill] = {
 }
 
 
+# The words a request to rearrange the collection uses. A request with none of them is
+# a question, and is answered without asking the model which skill it is: that call
+# ran before every answer and decided "answer" nearly every time.
+_ORGANIZE_CUE = re.compile(
+    r"\b(organi[sz]|group|arrang|sort|cluster|categori[sz]|classif|bucket)", re.IGNORECASE
+)
+
+
 def route(request: str) -> str:
     """Pick the skill that best fits a request. Never raises, never guesses.
 
     Rule 1, in code: the model is told to prefer `answer` under doubt, and the
     code enforces it regardless of what the model says - an unrecognized skill
     name, a failed model call, or an empty request all land on `answer`.
+    The model is only asked when the request uses a word for rearranging
+    (`_ORGANIZE_CUE`); anything else is `answer` with no call.
     """
     request = request.strip()
-    if not request:
+    if not request or not _ORGANIZE_CUE.search(request):
         return "answer"
 
     try:
