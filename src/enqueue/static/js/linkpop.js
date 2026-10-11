@@ -21,6 +21,7 @@
     ],
     open: ["M14 3h7v7", "M10 14 21 3", "M19 14v5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h5"],
     check: ["M20 6 9 17l-5-5"],
+    edit: ["M12 20h9", "M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"],
   };
 
   function glyph(name) {
@@ -100,6 +101,8 @@
 
   let opts = null;
   let pop = null;
+  let bar = null;
+  let form = null;
   let current = null;
   let doneTimer = 0;
 
@@ -121,19 +124,114 @@
     pop.setAttribute("role", "toolbar");
     pop.setAttribute("aria-label", "Link");
     pop.hidden = true;
-    pop.append(button("copy", "Copy link"), button("open", "Open in browser"));
+    bar = document.createElement("div");
+    bar.className = "linkpop-bar";
+    bar.append(
+      button("copy", "Copy link"),
+      button("open", "Open in browser"),
+      button("edit", "Edit link"),
+    );
+    pop.append(bar, buildForm());
     // Keep focus (and the caret) where it was: a click on the bar must not blur the
-    // note editor underneath, which would also fire its save-on-blur.
-    pop.addEventListener("mousedown", (e) => e.preventDefault());
+    // note editor underneath, which would also fire its save-on-blur. The form's own
+    // fields are the exception: they have to take focus to be typed in.
+    pop.addEventListener("mousedown", (e) => {
+      if (e.target.tagName !== "INPUT") e.preventDefault();
+    });
     pop.addEventListener("click", onAction);
     pop.addEventListener("keydown", (e) => {
       if (e.key === "Escape") {
         e.stopPropagation();
         hide();
+      } else if (e.key === "Enter" && e.target.tagName === "INPUT") {
+        e.preventDefault();
+        applyEdit();
       }
     });
     document.body.appendChild(pop);
     return pop;
+  }
+
+  // The edit form, for a link in a note being edited: what the link says and where it
+  // goes, with "Remove link" leaving the words as plain text.
+  function buildForm() {
+    form = document.createElement("div");
+    form.className = "linkpop-form";
+    form.hidden = true;
+    const field = (name, label) => {
+      const wrap = document.createElement("label");
+      wrap.className = "linkpop-field";
+      const cap = document.createElement("span");
+      cap.textContent = label;
+      const input = document.createElement("input");
+      input.type = name === "href" ? "url" : "text";
+      input.name = name;
+      input.autocomplete = "off";
+      input.spellcheck = false;
+      wrap.append(cap, input);
+      return wrap;
+    };
+    const row = document.createElement("div");
+    row.className = "linkpop-row";
+    const textButton = (act, label) => {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = "linkpop-text";
+      b.dataset.act = act;
+      b.textContent = label;
+      return b;
+    };
+    row.append(textButton("unlink", "Remove link"), textButton("apply", "Done"));
+    form.append(field("text", "Text"), field("href", "Link"), row);
+    return form;
+  }
+
+  const input = (name) => form.querySelector('input[name="' + name + '"]');
+
+  function openEdit() {
+    if (!current) return;
+    bar.hidden = true;
+    form.hidden = false;
+    input("text").value = current.textContent;
+    input("href").value = current.getAttribute("href") || "";
+    const r = current.getBoundingClientRect();
+    place(current, r.left, r.top, true);
+    input("text").focus();
+    input("text").select();
+  }
+
+  // Tell the editor its content changed, so it saves.
+  function touched(editor) {
+    if (editor) editor.dispatchEvent(new Event("input", { bubbles: true }));
+  }
+
+  function applyEdit() {
+    const link = current;
+    if (!link) return;
+    const editor = link.closest('[contenteditable="true"]');
+    const was = link.getAttribute("href") || "";
+    const href = input("href").value.trim();
+    if (!/^https?:\/\/\S+$/i.test(href)) {
+      input("href").focus();
+      say("A link needs an address that starts with http:// or https://", true);
+      return;
+    }
+    let text = input("text").value.trim();
+    // A bare address shows itself: when only the address changed, it still does.
+    if (!text || (text === was && link.textContent === was)) text = href;
+    link.textContent = text;
+    link.setAttribute("href", href);
+    hide();
+    touched(editor);
+  }
+
+  function unlink() {
+    const link = current;
+    if (!link) return;
+    const editor = link.closest('[contenteditable="true"]');
+    link.replaceWith(document.createTextNode(link.textContent));
+    hide();
+    touched(editor);
   }
 
   function resetCopy() {
@@ -173,6 +271,10 @@
     resetCopy();
     current = link;
     pop.dataset.href = link.href;
+    bar.hidden = false;
+    form.hidden = true;
+    // Editing is for a link in a note that is being edited, not one being read.
+    bar.querySelector('[data-act="edit"]').hidden = !link.isContentEditable;
     pop.hidden = false;
     place(link, e.clientX, e.clientY, e.detail === 0);
     // A keyboard activation (Enter on a focused link) reports detail 0: move focus into
@@ -192,9 +294,12 @@
   }
 
   async function onAction(e) {
-    const b = e.target.closest && e.target.closest(".linkpop-btn");
+    const b = e.target.closest && e.target.closest(".linkpop-btn, .linkpop-text");
     if (!b) return;
     e.stopPropagation();
+    if (b.dataset.act === "edit") return openEdit();
+    if (b.dataset.act === "apply") return applyEdit();
+    if (b.dataset.act === "unlink") return unlink();
     const url = pop.dataset.href || "";
     if (b.dataset.act === "open") {
       hide();
@@ -254,7 +359,15 @@
     window.addEventListener("keydown", (e) => {
       if (e.key === "Escape") hide();
     });
-    window.addEventListener("scroll", hide, true);
+    window.addEventListener(
+      "scroll",
+      (e) => {
+        // A long address scrolls inside its own field; that is not the page moving.
+        if (pop && e.target !== document && pop.contains(e.target)) return;
+        hide();
+      },
+      true,
+    );
     window.addEventListener("resize", hide);
   }
 

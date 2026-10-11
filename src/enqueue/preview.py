@@ -479,7 +479,7 @@ def _worth_a_browser(exc: Exception | None, fields: dict | None) -> bool:
 
 def fetch(artifact_id: str) -> dict | None:
     """Make the one request. Raises KeyError if the artifact is not a saved link."""
-    from .capture import title_from_url
+    from .capture import is_placeholder_title
     from .notes import _record_secrets
 
     conn = db.get_conn()
@@ -544,7 +544,7 @@ def fetch(artifact_id: str) -> dict | None:
         # The URL-derived title was a placeholder standing in until the page said its
         # own name. Replace it only if it is still that placeholder: a title the
         # person changed is theirs, and the page does not get to overrule it.
-        if fields["title"] and row["title"] == title_from_url(url):
+        if fields["title"] and is_placeholder_title(row["title"], url):
             conn.execute(
                 "UPDATE artifacts SET title = ?, updated_at = ? WHERE id = ?",
                 (fields["title"], _now(), artifact_id),

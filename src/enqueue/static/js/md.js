@@ -608,6 +608,58 @@
     return true;
   }
 
+  // Pasting an address over selected words makes those words the link, instead of
+  // replacing them with the address. Returns false (the caller pastes as usual) when
+  // nothing is selected, the clipboard is not one address, the selection is itself an
+  // address, or it reaches across blocks or into code, where markdown has no link.
+  function linkSelection(ed, text) {
+    const url = (text || "").trim();
+    if (!/^https?:\/\/\S+$/i.test(url)) return false;
+    const sel = window.getSelection();
+    if (!sel.rangeCount || sel.isCollapsed) return false;
+    const range = sel.getRangeAt(0);
+    if (!ed.contains(range.commonAncestorContainer)) return false;
+    const words = sel.toString();
+    if (!words.trim() || /^https?:\/\/\S+$/i.test(words.trim()) || words.includes("\n")) return false;
+    const blockOf = (node) => {
+      let el = node.nodeType === 1 ? node : node.parentElement;
+      while (el && el !== ed && !/^(P|DIV|LI|H1|H2|H3|BLOCKQUOTE|PRE)$/.test(el.tagName))
+        el = el.parentElement;
+      return el;
+    };
+    const block = blockOf(range.startContainer);
+    if (!block || block !== blockOf(range.endContainer) || block.tagName === "PRE") return false;
+    const host =
+      range.commonAncestorContainer.nodeType === 1
+        ? range.commonAncestorContainer
+        : range.commonAncestorContainer.parentElement;
+    if (host.closest("code")) return false;
+    // Already a link: the address is what changes.
+    const inside = host.closest("a.mdlink");
+    if (inside && ed.contains(inside)) {
+      inside.setAttribute("href", url);
+    } else {
+      document.execCommand("createLink", false, url);
+      const at = window.getSelection().anchorNode;
+      const made =
+        (at && (at.nodeType === 1 ? at : at.parentElement).closest("a")) ||
+        [...ed.querySelectorAll("a")].find((a) => !a.classList.contains("mdlink"));
+      if (!made) return false;
+      made.className = "mdlink";
+      made.setAttribute("href", url);
+      made.setAttribute("target", "_blank");
+      made.setAttribute("rel", "noopener");
+      // The caret goes after the link, so typing on does not extend it.
+      const after = document.createRange();
+      after.setStartAfter(made);
+      after.collapse(true);
+      sel.removeAllRanges();
+      sel.addRange(after);
+    }
+    ed.dispatchEvent(new Event("input", { bubbles: true }));
+    return true;
+  }
+
   // What a selection puts on the clipboard: { html, text }. Items selected out of a
   // list are given their list back (and a numbered one its number), so they paste as
   // a list anywhere. `text` is markdown when the selection holds a list - markers,

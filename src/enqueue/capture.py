@@ -43,18 +43,81 @@ def kind_for(mime: str | None, filename: str) -> str:
     return "file"
 
 
-def title_from_url(url: str) -> str:
-    """Best guess until the page is actually fetched.
+# The id a publisher hangs on the end of an article's address (Medium: a dash and
+# twelve hex characters). It is a word in the slug, not a word in the title.
+_SLUG_ID = re.compile(r"[ ]+(?=[0-9a-f]*\d)[0-9a-f]{8,16}$")
 
-    Fetching is the announced-crawl path and is out of scope here, so a link starts
-    life titled by its own address rather than by a lie.
+
+def title_from_url(url: str) -> str:
+    """A link's title until its page is fetched, and for good when the publisher
+    refuses the fetch: the article's own words out of its address, as a title.
+
+    `medium.com/x/the-end-of-prestige-0b96b649edf4` is "The end of prestige". The
+    publisher's id and the site name are left out: the site is already shown beside
+    the title, and "the end of prestige 0b96b649edf4 - medium.com" read as an
+    address, not as the thing saved. An address that names nothing (a bare domain,
+    one word, a document id) is titled by its site.
     """
+    parsed = urlparse(url)
+    host = parsed.netloc.replace("www.", "")
+    tail = (parsed.path or "").rstrip("/").split("/")[-1]
+    tail = re.sub(r"\.(html?|php|aspx?)$", "", tail)
+    tail = re.sub(r"[-_]+", " ", tail).strip()
+    tail = _SLUG_ID.sub("", tail)
+    if len(tail.split()) < 2:
+        return host or url[:120]
+    return tail[0].upper() + tail[1:]
+
+
+def _address_title(url: str) -> str:
+    """What `title_from_url` returned before it was cleaned up, kept so a title an
+    older build wrote is still known for the placeholder it is."""
     parsed = urlparse(url)
     tail = (parsed.path or "").rstrip("/").split("/")[-1]
     tail = re.sub(r"\.(html?|php|aspx?)$", "", tail)
     tail = re.sub(r"[-_]+", " ", tail).strip()
     host = parsed.netloc.replace("www.", "")
     return f"{tail} - {host}" if tail else host or url[:120]
+
+
+def is_placeholder_title(title: str | None, url: str) -> bool:
+    """Whether a link's title is one made from its address (now or by an older build,
+    or the bare address the phone saves) rather than the page's name or the person's
+    own. Only a placeholder may be replaced, by a preview or by a better placeholder."""
+    title = (title or "").strip()
+    return not title or title in (title_from_url(url), _address_title(url), url.strip())
+
+
+def retitle_placeholders() -> int:
+    """Give every link still titled by its address the clean form of that title.
+
+    Runs at engine startup; a link already clean, named by its page or renamed by the
+    person is left alone, so a second run changes nothing. `updated_at` is not
+    touched (the wall keeps its order); the push carries the title to the phone, which
+    applies a snapshot with an equal key.
+    """
+    conn = db.get_conn()
+    try:
+        rows = conn.execute(
+            "SELECT id, title, source_url FROM artifacts WHERE kind = 'link'"
+            " AND source_url IS NOT NULL AND title_explicit = 0"
+            " AND deleted_at IS NULL AND vaulted_at IS NULL"
+        ).fetchall()
+    finally:
+        conn.close()
+    changed = []
+    for row in rows:
+        clean = title_from_url(row["source_url"])
+        if row["title"] != clean and is_placeholder_title(row["title"], row["source_url"]):
+            changed.append((clean, row["id"]))
+    if not changed:
+        return 0
+    with db.transaction() as conn:
+        conn.executemany("UPDATE artifacts SET title = ? WHERE id = ?", changed)
+    for _, artifact_id in changed:
+        ingest_queue.submit_background(artifact_id)  # the title is indexed with the text
+        push_artifact(artifact_id)
+    return len(changed)
 
 
 def link(url: str, local_only: bool = False, title: str | None = None) -> dict:

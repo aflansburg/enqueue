@@ -97,6 +97,16 @@ def serve() -> None:
     except Exception as exc:  # noqa: BLE001 - never block startup on this
         print(f"[engine] could not start the summary sweeper/backfill: {exc}")
 
+    # Links an older build titled by their address get the clean title (capture.py).
+    try:
+        from .. import capture
+
+        retitled = capture.retitle_placeholders()
+        if retitled:
+            print(f"[engine] gave {retitled} links a clean title")
+    except Exception as exc:  # noqa: BLE001 - never block startup on this
+        print(f"[engine] could not retitle links: {exc}")
+
     from .. import events
 
     events.emit("start", "engine ready")

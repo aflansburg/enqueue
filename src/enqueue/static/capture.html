@@ -972,6 +972,10 @@
       // Text with lines or a list goes in as markdown (md.js clipToMd / pasteMd), the
       // same as in the note editor, so a pasted list is one list here too.
       const cd = event.clipboardData;
+      if (linkSelection(field, (cd && cd.getData("text")) || "")) {
+        event.preventDefault();
+        return;
+      }
       const clip = clipToMd((cd && cd.getData("text")) || "", (cd && cd.getData("text/html")) || "");
       if (clip.blocks && pasteMd(field, clip.src)) event.preventDefault();
       return;

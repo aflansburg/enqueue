@@ -972,6 +972,15 @@ So none of crawl4ai's anti-detection is enabled (no `enable_stealth`, `magic`, `
 crawl4ai's cache lives under the data dir (`CRAWL4_AI_BASE_DIRECTORY`), not `~/.crawl4ai`.
 A missing Chromium fails with "run bin/setup" rather than silently.
 
+**A link's title before, or without, a preview (`capture.title_from_url`).**
+A link is titled from its address until its page says its own name, and for good when the publisher refuses the fetch (Medium does).
+The title is the article's words out of the last path segment, first letter capitalised, with the publisher's id dropped (a trailing 8 to 16 hex characters holding a digit, Medium's `-0b96b649edf4`) and without the site name, which the card already shows.
+It used to be "the end of prestige ... 0b96b649edf4 - medium.com", which read as an address.
+An address that names nothing (a bare domain, a one-word segment, a document id) is titled by its site.
+`is_placeholder_title` knows every form a placeholder has had (the clean one, the old "slug - host", the bare address the phone saves), which is what lets a preview replace it; a title the page gave or the person set (`title_explicit`) is never touched.
+`retitle_placeholders()` runs at engine startup and gives links still carrying an old placeholder the clean one, without touching `updated_at` (the wall keeps its order); the phone gets it because it applies a snapshot with an equal key.
+The phone still titles a link it captures by the bare address until the desktop has seen it.
+
 **A shared link's name is its title.**
 A capture of exactly "Title" on one line and the address alone on the next (what a share sheet or "copy link" hands over) saves the line as the link's title, not as a note (`capture.html` `splitLink`, `sync.rs` `shared_link_title` for the phone, `LinkCreate.title`).
 Before this, the page name landed as the link's first note and read like something the person wrote.
@@ -1301,6 +1310,16 @@ Clipboard HTML is read only when it holds a list (a web page's list has no marke
 Copying used to hand over bare `<li>` elements with no list around them and plain text with no markers: items now get their `<ul>`/`<ol>` back (a numbered one keeps its number), and the plain text is markdown whenever the selection holds a list.
 A page that pastes must define `esc` (md() needs it): the home has it in `util.js`, `capture.html` and `mobile.html` define their own.
 `tests/js/clip.js` pins the text side; the DOM side needs a browser.
+
+### Links in a note: made by pasting, edited from the link bar
+
+Pasting an address over selected words links the words (`md.js linkSelection`, called first by the paste handlers in `artifact.js` and `capture.html`): `createLink` so it is one undo step, then the `<a>` is given md()'s own shape (`class="mdlink"`, `target`, `rel`) and the caret is put after it.
+It declines, and the paste goes on as usual, when nothing is selected, the clipboard is not exactly one `http(s)` address, the selected words are themselves an address, or the selection crosses blocks or sits in code.
+Pasting over words that are already a link changes where it goes.
+The link bar (`js/linkpop.js`) has a third action, Edit, shown only when the link is in a note being edited (`isContentEditable`; never in the reader, a chat answer or on the phone, whose writing page is plain markdown).
+It swaps the bar for a small form: Text, Link, "Remove link" (the words stay as plain text) and Done; Enter applies, Escape closes.
+The form's fields must be able to take focus, so the bar's `mousedown` guard skips inputs, and a scroll inside a field does not dismiss the bar.
+An edit dispatches `input` on the editor, which is what saves it.
 The desktop editor saves as you type (debounced) and on window blur, and `refreshIfStale` never rebuilds an editor holding unsaved words (it re-reads the page only when the store changed elsewhere): rebuilding it on window focus used to drop the words typed since the last blur.
 
 ### The title is prepended for indexing only

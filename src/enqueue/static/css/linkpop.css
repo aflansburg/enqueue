@@ -18,8 +18,72 @@
   box-shadow: var(--shadow-lifted);
   animation: linkpop-in var(--dur-fast, 140ms) cubic-bezier(0.16, 1, 0.3, 1);
 }
-.linkpop[hidden] {
+.linkpop[hidden],
+.linkpop [hidden] {
   display: none;
+}
+.linkpop-bar {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+/* Editing a link in a note: what it says and where it goes. */
+.linkpop-form {
+  display: grid;
+  gap: var(--sp-2);
+  width: min(320px, calc(100vw - 32px));
+  padding: var(--sp-2);
+}
+.linkpop-field {
+  display: grid;
+  grid-template-columns: 40px 1fr;
+  align-items: center;
+  gap: var(--sp-2);
+  font-size: 12px;
+  color: var(--text-mute);
+}
+.linkpop-field input {
+  min-width: 0;
+  height: 32px;
+  padding: 0 var(--sp-2);
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  font-size: 14px;
+}
+.linkpop-field input:focus-visible {
+  outline: 2px solid color-mix(in oklab, var(--lavender-focus) 50%, transparent);
+  outline-offset: 1px;
+}
+.linkpop-row {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--sp-2);
+}
+.linkpop-text {
+  height: 32px;
+  padding: 0 var(--sp-3);
+  border: 0;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--text-dim);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+.linkpop-text:hover {
+  background: var(--surface-2);
+  color: var(--text);
+}
+.linkpop-text[data-act="apply"] {
+  color: var(--text);
+  font-weight: 500;
+}
+.linkpop-text:focus-visible {
+  outline: 2px solid color-mix(in oklab, var(--lavender-focus) 50%, transparent);
+  outline-offset: 1px;
 }
 @keyframes linkpop-in {
   from {

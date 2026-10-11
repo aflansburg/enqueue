@@ -1764,7 +1764,8 @@
       }
     });
     // Paste. An image on the clipboard is embedded into the note (uploaded as a
-    // hidden image artifact, referenced as `![](/artifacts/{id}/blob)`). One plain
+    // hidden image artifact, referenced as `![](/artifacts/{id}/blob)`). An address
+    // pasted over selected words turns the words into a link to it. One plain
     // line is typed in at the caret. Anything with lines or a list is pasted as
     // markdown (md.js clipToMd / pasteMd), so a list arrives as one list instead of a
     // paragraph per line. Styled HTML is only read for its lists: anything else would
@@ -1784,6 +1785,8 @@
       }
       e.preventDefault();
       const text = (cd && cd.getData("text")) || "";
+      // An address pasted over selected words links the words (md.js linkSelection).
+      if (linkSelection(ed, text)) return;
       const clip = clipToMd(text, (cd && cd.getData("text/html")) || "");
       const at = window.getSelection().anchorNode;
       const inCode = at && (at.nodeType === 1 ? at : at.parentElement).closest("pre");
