@@ -30,11 +30,10 @@ async def serve_font(name: str) -> Response:
     font_path = os.path.join(str(font_dir), name)
     if not os.path.isfile(font_path):
         raise HTTPException(status_code=404, detail="font not found") from None
-    # no-cache, not a year of `immutable`: the WebView keys its cache by origin
-    # (127.0.0.1:8787), not by the process behind the port, so an `immutable` font
-    # from a stray server on 8787 is served for a year and never revalidated. The
-    # WebView still gets a 304 when the file is unchanged (FileResponse sends
-    # ETag/Last-Modified), so the revalidation cost is one conditional request.
+    # no-cache, not a year of `immutable`. The WebView keys its cache by origin
+    # (127.0.0.1:8787), not by the process on the port. An `immutable` font from a stray
+    # server on 8787 is then served for a year and never revalidated. no-cache still gives
+    # a 304 when the file is unchanged, at the cost of one request.
     return FileResponse(font_path, headers={"Cache-Control": "no-cache"})
 
 
