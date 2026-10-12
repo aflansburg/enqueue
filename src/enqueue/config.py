@@ -176,7 +176,10 @@ except ValueError:
 VECTOR_STORE = os.getenv("ENQ_VECTOR_STORE", "sqlite-vec")
 
 API_HOST = "127.0.0.1"
-API_PORT = 8787
+# The shell passes a fresh free port each launch in ENQ_API_PORT, so a stray server on
+# the old fixed 8787 can no longer share the WebView's origin and poison its cache. The
+# guard origins below derive from this. A bare `enq serve` still binds 8787.
+API_PORT = int(os.getenv("ENQ_API_PORT", "8787"))
 API_URL = f"http://{API_HOST}:{API_PORT}"
 # The only Host names the engine answers to (api/guard.py): a page from any other
 # site, even one whose name resolves to 127.0.0.1, is refused.
