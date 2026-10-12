@@ -242,6 +242,13 @@ desktop/gen/schemas/
 .serena/
 .impeccable/
 
+# Editor state (JetBrains). Per machine, never shared.
+.idea/
+
+# Screenshots taken while reviewing the interface. They show a real library, so they
+# stay out of the repository (they were committed once, and removed from history).
+_review_artifacts/
+
 # Evaluation output. Every run is written to disk so regressions can be traced,
 # but the runs are results rather than source.
 eval/runs/
