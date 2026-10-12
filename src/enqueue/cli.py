@@ -22,9 +22,8 @@ app = typer.Typer(add_completion=False, help="Enqueue: capture anything, organis
 def _base_url() -> str:
     """Where the engine listens.
 
-    The shell runs the engine on a fresh per-launch port and records it in
-    `DATA_DIR/port`, so a CLI in another terminal reads that file to find it. An
-    explicit ENQ_API_PORT wins. With neither, 8787 is the default.
+    The engine records its port in `DATA_DIR/port`, so the CLI finds it even when it is
+    not on the default port. An explicit ENQ_API_PORT wins. With neither, 8787 is used.
     """
     import os
 

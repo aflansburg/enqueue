@@ -366,8 +366,8 @@ def start_scheduler() -> None:
 def _live_port() -> int:
     """The port a running engine is on: the one it recorded, else the default.
 
-    The shell runs the engine on a fresh per-launch port, so a restore must check that
-    port, not only 8787, or it could overwrite a live library.
+    A restore must refuse while the engine runs, so it checks the recorded port, not
+    only 8787, or it could overwrite a live library.
     """
     try:
         recorded = (config.DATA_DIR / "port").read_text().strip()

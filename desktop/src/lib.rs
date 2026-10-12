@@ -2894,8 +2894,7 @@ mod desktop {
     use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 
     /// The port a bare `enq serve` binds, and the one the shell attaches to when an
-    /// engine is already up. A launch that spawns its own engine uses a free port, so a
-    /// stray server on this fixed port can never share the WebView's origin.
+    /// engine is already up. A launch that spawns its own engine picks a free port.
     const DEFAULT_PORT: u16 = 8787;
 
     /// The engine port for this launch, chosen once in `run()`. Every URL the shell
@@ -3469,9 +3468,9 @@ mod desktop {
         // Spawn the engine but do NOT wait for it here, so Tauri's own init overlaps the
         // engine boot; the wait moves into setup, right before the one window that needs
         // the engine's URL.
-        // Check for a manually started engine on the default port before choosing ours,
-        // so `host_port()` still reads the default here. When one is up, attach to it.
-        // Otherwise spawn our own on a fresh free port no stray server can be holding.
+        // Check the default port before choosing ours, so `host_port()` reads the
+        // default here. Attach to an engine already up; otherwise spawn one on a free
+        // port.
         let attached = already_running();
         let port = if attached {
             DEFAULT_PORT
@@ -3532,12 +3531,10 @@ mod desktop {
                 #[cfg(target_os = "macos")]
                 app.set_activation_policy(tauri::ActivationPolicy::Regular);
 
-                // Wipe the WebView cache on a version change. The WebView keys its cache
-                // by origin, not by the process on the port, and caches some assets past
-                // a no-cache header, so an upgrade can leave the window painting a prior
-                // build's bytes. A clear per version bump makes the new build load cold.
-                // `clear_all_browsing_data` clears the shared store, so one call covers
-                // both windows.
+                // Wipe the WebView cache on a version change so a new build loads cold.
+                // The WebView caches some assets past a no-cache header, so an upgrade
+                // could otherwise paint a prior build's bytes. `clear_all_browsing_data`
+                // clears the shared store, so one call covers both windows.
                 if webview_version_changed(app) {
                     let _ = window.clear_all_browsing_data();
                     let _ = window.eval("window.location.reload()");

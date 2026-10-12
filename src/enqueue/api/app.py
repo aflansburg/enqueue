@@ -116,8 +116,8 @@ def serve() -> None:
 
     backups.start_scheduler()
 
-    # Record the live port so the CLI can reach a shell-launched engine on its fresh
-    # per-launch port, not only 8787. Best-effort: a stale file from a crash yields a
+    # Record the live port so the CLI and a restore can find the engine when it is not
+    # on the default port. Best-effort: a stale file left by a crash yields a
     # ConnectError the CLI already reports as "engine is not running".
     port_file = config.DATA_DIR / "port"
     try:
