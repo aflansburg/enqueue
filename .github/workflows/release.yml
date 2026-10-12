@@ -40,12 +40,10 @@ jobs:
           distribution: temurin
           java-version: "21"
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
-      # Pin the NDK to the version the project builds with locally.
-      - name: Install Android NDK
-        run: sdkmanager "ndk;27.1.12297006"
+      # The runner image carries the Android SDK and NDK (ANDROID_HOME,
+      # ANDROID_NDK_LATEST_HOME), the same ones the CI android job builds with.
+      # android-actions/setup-android@v3 was dropped: it asks sdkmanager for the
+      # "tools" package, which no longer exists, and failed the v0.2.0 release.
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
@@ -70,7 +68,7 @@ jobs:
       - name: Build APK
         working-directory: desktop
         run: |
-          export NDK_HOME="$ANDROID_HOME/ndk/27.1.12297006"
+          export NDK_HOME="$ANDROID_NDK_LATEST_HOME"
           cargo tauri android build --debug --target aarch64
 
       - name: Name the artifact
@@ -145,8 +143,17 @@ jobs:
 
       # bin/release reads APPLE_SIGNING_IDENTITY (sign) and APPLE_ID/APPLE_PASSWORD/
       # APPLE_TEAM_ID (Tauri notarizes) from the job env above.
+      # An unset secret still reaches the job as an EMPTY variable, and Tauri signs
+      # whenever APPLE_CERTIFICATE exists at all: with no secrets it tried to import
+      # an empty certificate and failed the bundle ("security import ... not valid").
+      # Drop the empty ones so an unsigned build is really unsigned.
       - name: Build the .dmg
-        run: bin/release desktop
+        run: |
+          for v in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY \
+                   APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+            [ -n "${!v}" ] || unset "$v"
+          done
+          bin/release desktop
 
       - name: Name the artifact
         id: dmg
