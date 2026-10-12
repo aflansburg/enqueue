@@ -3029,6 +3029,29 @@ mod desktop {
         let _ = std::fs::write(path, format!("{},{}", at.x, at.y));
     }
 
+    /// True once per build: the app version differs from the one last recorded.
+    ///
+    /// The marker lives beside the other shell state in `~/.enqueue-poc`. A missing
+    /// marker (first run, or a wiped data dir) counts as changed, so a fresh install
+    /// also loads cold. The new version is written whether or not the read succeeded,
+    /// so a transient read error does not wipe the cache on every launch.
+    fn webview_version_changed(app: &tauri::App) -> bool {
+        let Some(home) = std::env::var_os("HOME") else {
+            return false;
+        };
+        let marker = PathBuf::from(home).join(".enqueue-poc/webview-version");
+        let current = app.package_info().version.to_string();
+        let last = std::fs::read_to_string(&marker).ok();
+        let changed = last.as_deref().map(str::trim) != Some(current.as_str());
+        if changed {
+            if let Some(dir) = marker.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let _ = std::fs::write(&marker, &current);
+        }
+        changed
+    }
+
     /// Where the engine lives.
     ///
     /// A bundled .app starts with the working directory at `/`, so deriving the repo from
@@ -3466,6 +3489,18 @@ mod desktop {
 
                 #[cfg(target_os = "macos")]
                 app.set_activation_policy(tauri::ActivationPolicy::Regular);
+
+                // Wipe the WebView cache when the app version changes. The WebView
+                // keys its cache by origin (127.0.0.1:8787), not by the process on the
+                // port, and caches some assets heuristically past a no-cache header, so
+                // an upgrade (or a stray server that held 8787 earlier) can leave the
+                // window painting a prior build's bytes. A one-time clear on a version
+                // bump guarantees the new build loads cold. `clear_all_browsing_data`
+                // clears the shared store, so one call covers both windows.
+                if webview_version_changed(app) {
+                    let _ = window.clear_all_browsing_data();
+                    let _ = window.eval("window.location.reload()");
+                }
 
                 let _ = window.show();
                 let _ = window.set_focus();
